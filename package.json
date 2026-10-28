@@ -1,0 +1,24 @@
+{
+  "name": "dsh-cpa",
+  "version": "0.1.8",
+  "description": "Local CLIProxyAPI settings and authorization for DeepSeek Harness",
+  "type": "module",
+  "license": "MIT",
+  "author": "M4rkzzz",
+  "repository": {"type": "git", "url": "git+https://github.com/M4rkzzz/dsh-cpa.git"},
+  "homepage": "https://github.com/M4rkzzz/dsh-cpa#readme",
+  "keywords": ["dsh-plugin", "cliproxyapi", "cpa", "chatgpt", "oauth"],
+  "main": "./lib/index-v018.mjs",
+  "exports": {".": "./lib/index-v018.mjs", "./client": "./lib/client-v018.js"},
+  "files": ["lib", "cordis.patch.yml", "README.md", "README.zh-CN.md", "SECURITY.md", "LICENSE", "THIRD_PARTY_NOTICES.md"],
+  "engines": {"node": ">=22.19.0", "dsh": ">=0.2.1-rc.2"},
+  "dsh": {"manifestVersion": 1, "bundle": {"patch": "./cordis.patch.yml"}, "client": {"inject": ["@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-client-ui-primitives"], "platform": "web"}},
+  "scripts": {"test": "node --test --experimental-test-isolation=none tests/*.test.mjs"}
+}
+
+
+
+
+
+
+
