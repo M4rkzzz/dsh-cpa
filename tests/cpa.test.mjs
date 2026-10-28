@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {localUrl, normalizeAccounts, normalizeCatalog, normalizeQuota, request} from '../lib/cpa-v013a.mjs';
-import {sameOrigin, makeHandler} from '../lib/index-v013a.mjs';
-import {additions, createSynchronizer} from '../lib/sync-v013a.mjs';
+import {localUrl, normalizeAccounts, normalizeCatalog, normalizeQuota, request} from '../lib/cpa-v014a.mjs';
+import {sameOrigin, makeHandler} from '../lib/index-v014a.mjs';
+import {additions, createSynchronizer} from '../lib/sync-v014a.mjs';
 
 test('management requests are limited to fixed loopback endpoints', () => {
   assert.equal(localUrl(18317, '/v1/models'), 'http://127.0.0.1:18317/v1/models');
@@ -61,6 +61,7 @@ test('catalog sync fails closed without writing when CPA or metadata is unavaila
   const sync=createSynchronizer(settings,{installation:async()=>({port:1,apiKey:'k'}),normalizeCatalog:x=>x.data,request:async()=>({data:['gpt-7-example']}),readCache:async()=>{throw Error('missing-cache')}});
   const state=await sync.run();assert.equal(state.status,'error');assert.equal(writes,0);
 });
+
 
 
 
