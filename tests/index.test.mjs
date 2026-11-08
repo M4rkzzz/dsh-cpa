@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, writeFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {apply, sameOrigin} from '../lib/index-v024.mjs';
+import {apply, sameOrigin} from '../lib/index-v025.mjs';
 
 const NOW = 2000000000000;
 const grant = id => ({kind: 'grant', payload: {access: 'synthetic-token-' + id, accountId: 'synthetic-account-' + id, expires: NOW + 3600000}});
@@ -61,7 +61,7 @@ async function fixture(t, options = {}) {
         revision++;
       }
     },
-    webServer: {getOrigin: () => 'http://localhost:7452'},
+    webServer: {protocol: 'http:', getOrigin: () => 'http://localhost:7452'},
     connection: {authenticatedUrl: origin => origin + '/synthetic-login', fetch: {register: route => {
       if (route.path === '/api/cpa-settings') handler = route.fetch;
       else { assert.equal(route.path, '/api/cpa-activity'); activityHandler = route.fetch; }
@@ -75,15 +75,15 @@ async function fixture(t, options = {}) {
     if (oldHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldHome;
     await rm(directory, {recursive: true, force: true});
   });
-  const request = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => handler(new Request('http://localhost:7452/api/cpa-settings', {
+  const request = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => handler(new Request('http://dsh.internal/api/cpa-settings', {
     method, headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
     ...(body === undefined ? {} : {body: JSON.stringify(body)})
   }));
-  const activity = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => activityHandler(new Request('http://localhost:7452/api/cpa-activity', {
+  const activity = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => activityHandler(new Request('http://dsh.internal/api/cpa-activity', {
     method, headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
     ...(body === undefined ? {} : {body: JSON.stringify(body)})
   }));
-  return {ctx, calls, timers, mutations, modelCalls, listeners, settings, dispose, request, activity, activityRaw: req => activityHandler(req),
+  return {ctx, calls, timers, mutations, modelCalls, listeners, settings, dispose, request, activity, raw: req => handler(req), activityRaw: req => activityHandler(req),
     setRecord: value => { record = value; }, setFetcher: value => { upstream = value; }, advance: ms => { now += ms; },
     get removed() { return removed; },
     get: async () => { const response = await request(); assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store'); return response.json(); },
@@ -256,7 +256,7 @@ test('activity errors do not expose arbitrary catalog or provider error text', a
 
 test('activity disposal during body parsing rejects control work before it starts', async t => {
   const f = await fixture(t), body = deferred();
-  const req = new Request('http://localhost:7452/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
+  const req = new Request('http://dsh.internal/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
   req.json = () => body.promise;
   const pending = f.activityRaw(req);
   f.dispose();
@@ -270,7 +270,7 @@ test('cancel and disable supersede older control bodies that finish parsing late
   for (const [action, stop] of [['pelican-run', 'pelican-cancel'], ['pelican-configure', 'pelican-configure']]) {
     await t.test(action, async t => {
       const f = await fixture(t), body = deferred();
-      const req = new Request('http://localhost:7452/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
+      const req = new Request('http://dsh.internal/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
       req.json = () => body.promise;
       const pending = f.activityRaw(req);
       const stopped = await f.activity({action: stop, enabled: false});
@@ -340,6 +340,107 @@ test('same-origin writes compare scheme, host and port and reject malformed orig
   assert.equal(check('http://example.invalid/api', 'example.invalid', undefined), false);
   assert.equal(check('http://localhost/api', 'localhost', undefined, {'content-type': 'text/plain'}), false);
   assert.equal(check('http://localhost/api', 'localhost', undefined, {'sec-fetch-site': 'cross-site'}), false);
+});
+
+const bridgeRequest = (host, origin, extra = {}, url = 'http://dsh.internal/api/cpa-settings') => new Request(url, {
+  method: 'POST', headers: {host, 'content-type': 'application/json; charset=utf-8', ...(origin === undefined ? {} : {origin}), ...extra},
+  body: '{}',
+});
+
+test('the exact DSH bridge origin uses trusted HTTP or HTTPS and real Host authority', () => {
+  for (const [protocol, host, origin] of [
+    ['http:', '127.0.0.1:1699', 'http://127.0.0.1:1699'],
+    ['https:', 'localhost:7452', 'https://localhost:7452'],
+    ['https:', 'cpa.example.invalid:8443', 'https://cpa.example.invalid:8443'],
+    ['https:', 'cpa.example.invalid:443', 'https://cpa.example.invalid'],
+    ['http:', 'localhost:80', 'http://localhost'],
+    ['https:', '[::1]:7452', 'https://[::1]:7452'],
+  ]) assert.equal(sameOrigin(bridgeRequest(host, origin), protocol), true, origin);
+  for (const origin of ['https://localhost:7452', 'http://localhost:7453', 'http://127.0.0.1:7452', 'http://dsh.internal']) {
+    assert.equal(sameOrigin(bridgeRequest('localhost:7452', origin), 'http:'), false, origin);
+  }
+});
+
+test('bridge authority reconstruction is not granted to other URL origins or unknown protocols', () => {
+  for (const url of ['https://dsh.internal/api', 'http://dsh.internal:7452/api', 'http://other.internal/api', 'ftp://dsh.internal/api']) {
+    assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'http://localhost:7452', {}, url), 'http:'), false, url);
+  }
+  for (const protocol of [undefined, null, '', 'http', 'https', 'ws:', 'ftp:', true, {}]) {
+    assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'http://localhost:7452'), protocol), false);
+    assert.equal(sameOrigin(bridgeRequest('localhost:7452', undefined), protocol), false);
+  }
+  assert.equal(sameOrigin(bridgeRequest('attacker.invalid', 'http://attacker.invalid', {}, 'http://localhost:7452/api'), 'http:'), false);
+  assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'http://localhost:7452', {}, 'http://localhost:7452/api')), true);
+});
+
+test('bridge checks reject malformed Host and Origin before URL normalization can hide delimiters', () => {
+  for (const host of ['', 'localhost:7452/', 'localhost:7452/path', 'localhost:7452?', 'localhost:7452#',
+    'user@localhost:7452', '@localhost:7452', 'localhost:7452\\path', 'localhost:7452,evil.invalid',
+    'localhost:7452;foo', 'localhost :7452', 'localhost:', ':7452', 'localhost:99999', 'http://localhost:7452']) {
+    assert.equal(sameOrigin(bridgeRequest(host, 'http://localhost:7452'), 'http:'), false, host);
+  }
+  for (const origin of ['null', '', 'http://user@localhost:7452', 'http://@localhost:7452',
+    'http://localhost:7452/path', 'http://localhost:7452/../', 'http://localhost:7452?',
+    'http://localhost:7452#', 'http://localhost:7452/#', 'http://localhost:7452\\',
+    'http://localhost:7452 http://attacker.invalid', 'http://localhost:7452,https://attacker.invalid']) {
+    assert.equal(sameOrigin(bridgeRequest('localhost:7452', origin), 'http:'), false, origin);
+  }
+});
+
+test('untrusted forwarded headers cannot establish or change the real origin', () => {
+  const spoof = {'x-forwarded-proto': 'https', 'x-forwarded-host': 'attacker.invalid', forwarded: 'for=127.0.0.1;proto=https;host=attacker.invalid'};
+  assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'http://localhost:7452', spoof), 'http:'), true);
+  assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'https://attacker.invalid', spoof), 'http:'), false);
+  assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'https://localhost:7452', spoof), 'http:'), false);
+  assert.equal(sameOrigin(bridgeRequest('localhost:7452', 'http://localhost:7452', {'x-forwarded-proto': 'http'})), false);
+});
+
+test('missing-Origin bridge requests require real loopback Host plus JSON and non-cross-site context', () => {
+  for (const host of ['localhost:7452', '127.0.0.1:1699', '[::1]:7452']) {
+    for (const protocol of ['http:', 'https:']) assert.equal(sameOrigin(bridgeRequest(host, undefined), protocol), true, host);
+  }
+  for (const host of ['dsh.internal', 'cpa.example.invalid', '192.168.1.2:7452']) {
+    assert.equal(sameOrigin(bridgeRequest(host, undefined, {'x-forwarded-host': 'localhost:7452'}), 'http:'), false, host);
+  }
+  for (const headers of [{'content-type': 'text/plain'}, {'content-type': ''}, {'sec-fetch-site': 'cross-site'}, {'sec-fetch-site': 'same-site'}]) {
+    assert.equal(sameOrigin(bridgeRequest('localhost:7452', undefined, headers), 'http:'), false);
+  }
+});
+
+test('both POST routes accept the HTTPS bridge and reject scheme port and forwarded spoofing', async t => {
+  const f = await fixture(t);
+  f.ctx.webServer.protocol = 'https:';
+  for (const [send, action] of [[f.request, 'cancel'], [f.activity, 'logs-clear']]) {
+    assert.equal((await send({action}, {origin: 'https://localhost:7452'})).status, 200);
+    for (const headers of [
+      {origin: 'http://localhost:7452'}, {origin: 'https://localhost:7453'},
+      {host: 'localhost:7453', origin: 'https://localhost:7452'},
+      {origin: 'http://localhost:7452', 'x-forwarded-proto': 'http', 'x-forwarded-host': 'localhost:7452'},
+    ]) assert.equal((await send({action}, headers)).status, 403);
+  }
+  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0); assert.equal(f.mutations.length, 0);
+});
+
+test('both POST routes fail closed when a bridge has no trustworthy service protocol', async t => {
+  const f = await fixture(t);
+  for (const protocol of [undefined, null, 'http', 'ftp:']) {
+    f.ctx.webServer.protocol = protocol;
+    for (const [send, action] of [[f.request, 'cancel'], [f.activity, 'logs-clear']]) {
+      const response = await send({action}, {'x-forwarded-proto': 'http', 'x-forwarded-host': 'localhost:7452'});
+      assert.equal(response.status, 403); assert.equal((await response.json()).error, 'cross-origin-write-denied');
+    }
+  }
+  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0); assert.equal(f.mutations.length, 0);
+});
+
+test('both POST routes retain missing-Origin loopback support without treating dsh.internal as local', async t => {
+  const f = await fixture(t);
+  for (const [raw, action, path] of [[f.raw, 'cancel', 'cpa-settings'], [f.activityRaw, 'logs-clear', 'cpa-activity']]) {
+    for (const [host, status] of [['localhost:7452', 200], ['dsh.internal', 403], ['example.invalid', 403]]) {
+      const req = new Request('http://dsh.internal/api/' + path, {method: 'POST', headers: {host, 'content-type': 'application/json'}, body: JSON.stringify({action})});
+      assert.equal((await raw(req)).status, status, host);
+    }
+  }
 });
 
 test('quota cache is reused only for the same credential snapshot', async t => {

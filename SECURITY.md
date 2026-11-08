@@ -4,6 +4,8 @@ Do not include credentials, OAuth callback URLs, account identifiers, profile fi
 
 The plugin uses DSH native ChatGPT Codex OAuth and credential storage. It reads the resulting grant in process for fixed ChatGPT quota and model catalog requests; credentials are never returned to the browser. Local write actions require DSH authentication and same-origin checks. API responses are `Cache-Control: no-store`. The plugin does not launch a local proxy or read CLIProxyAPI credentials.
 
+Host Connection may expose a synthetic `http://dsh.internal` request URL. For this bridge only, write checks derive the public origin from the already-validated Host header and the injected web server's trusted HTTP(S) protocol. They do not trust `Forwarded` or `X-Forwarded-*`. Requests without Origin remain limited to loopback JSON clients without cross-site fetch metadata. Desktop requests continue through its official cookie-forwarding transport; the plugin does not extract or replace authentication cookies.
+
 ## Request activity
 
 The public `llm/stream` observer records only bounded metadata for new `openai-codex` requests. It does not retain prompts, generated text, reasoning, tool arguments, replay state, session identifiers, headers, access tokens or raw provider errors. The recent-request buffer is limited to 200 entries; since-clear statistics are scalar aggregates. Reload or clear resets this data. Observing, clearing or unloading the observer must not abort ordinary host conversations or replace global fetch. Only explicitly supplied structured HTTP status is accepted; successful requests are not labeled HTTP 200 by inference.

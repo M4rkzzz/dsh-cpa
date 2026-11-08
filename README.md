@@ -4,7 +4,13 @@ DSH plugin for in-process ChatGPT Codex authorization, model discovery, account 
 
 Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. GitHub-source Market installs can detect version bumps on the default branch; a GitHub Release is not required for that channel. In Settings → CPA, choose **Add ChatGPT account**. Model sync adds account-listed models while retaining existing models and the default selection. Choose an `openai-codex` conversation model to use direct transport. Existing `chatgpt-cpa` sessions keep their original route until switched.
 
-## 0.2.4: request activity
+## 0.2.5: hot-update repair
+
+Retired backend entry paths remain as forwarding modules, so a host retaining an older package resolution can still activate the current implementation. This repairs the missing-entry activation failure during a 0.2.4 hot update. POST origin checks now account for Host Connection's internal bridge URL without weakening authentication or trusting forwarded headers. Plain-text HTTP failures retain safe status codes, and the page uses fewer repeated labels and explanations.
+
+After a failed 0.2.4 upgrade, verify actual activation and refresh the page after installing the repair. Replaced files or a Market “live” label alone do not prove that routes work. Do not delete credentials or unrelated plugins.
+
+## Request activity
 
 The CPA page observes **new `openai-codex` LLM requests after this plugin loads**, including pelican tests. Other providers, historical sessions, and account quota/catalog HTTP calls are not request-log entries. It does not replay or scan conversations.
 

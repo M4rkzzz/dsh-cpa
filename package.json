@@ -1,12 +1,12 @@
 {
   "name": "dsh-cpa",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "type": "module",
   "license": "MIT",
-  "main": "./lib/index-v024.mjs",
+  "main": "./lib/index-v025.mjs",
   "exports": {
-    ".": "./lib/index-v024.mjs",
-    "./client": "./lib/client-v024.js"
+    ".": "./lib/index-v025.mjs",
+    "./client": "./lib/client-v025.js"
   },
   "files": [
     "lib",

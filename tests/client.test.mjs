@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v024.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v025.js',import.meta.url),'utf8');
 const snapshot=(extra={})=>({online:true,management:true,authorizationPending:false,accounts:[],models:['synthetic-model'],sync:{status:'ok',missing:[]},quotaStale:false,...extra});
 const account=(label='Synthetic account')=>({label,status:'active',quota:{plan:'Synthetic',observedAt:new Date().toISOString(),windows:[{name:'primary',minutes:300,used:42,remaining:58}]}});
 
@@ -51,7 +51,8 @@ function harness({pill=false,visibility='visible',provider='openai-codex'}={}){
    let resolve,reject;const promise=new Promise((yes,no)=>{resolve=yes;reject=no});
    const body=options.body?JSON.parse(options.body):undefined;
    const request={url,action:body?.action??(url==='/api/cpa-activity'?'activity-get':'get'),body,options,pending:true,
-    respond(data,ok=true){assert.equal(request.pending,true);request.pending=false;resolve({ok,json:async()=>data})},
+    respond(data,ok=true,status=ok?200:400){assert.equal(request.pending,true);request.pending=false;resolve({ok,status,json:async()=>data})},
+    malformed(status,detail='synthetic-private-response'){assert.equal(request.pending,true);request.pending=false;resolve({ok:status>=200&&status<300,status,json:async()=>{throw SyntaxError(detail)}})},
     fail(message='synthetic-offline'){assert.equal(request.pending,true);request.pending=false;reject(Error(message))},
    };
    requests.push(request);return promise;
@@ -66,6 +67,7 @@ function harness({pill=false,visibility='visible',provider='openai-codex'}={}){
  async function flush(){for(let i=0;i<40;i++){await Promise.resolve();if(dirty&&mounted)render()}}
  function children(node){if(typeof node?.type==='function')return [node.type(node.props)];return node?.children??[]}
  function text(node=tree){if(node==null||typeof node==='boolean')return '';if(Array.isArray(node))return node.map(text).join('');if(typeof node!=='object')return String(node);return children(node).map(text).join('')}
+ function visibleText(node=tree){if(node==null||typeof node==='boolean')return '';if(Array.isArray(node))return node.map(visibleText).join('');if(typeof node!=='object')return String(node);if(node.props?.hidden)return '';const content=children(node);return (node.type==='details'&&!node.props.open?content.filter(child=>child?.type==='summary'):content).map(visibleText).join('')}
  function nodes(node=tree){if(!node||typeof node!=='object')return [];if(Array.isArray(node))return node.flatMap(nodes);return [node,...children(node).flatMap(nodes)]}
  function button(label){return nodes().find(node=>(node.type==='Button'||node.type==='button')&&text(node)===label)}
  function click(label){const found=button(label);assert.ok(found,'missing button '+label);assert.equal(!!found.props.disabled,false,'disabled button '+label);return found.props.onClick()}
@@ -76,7 +78,7 @@ function harness({pill=false,visibility='visible',provider='openai-codex'}={}){
  function unmount(){mounted=false;for(const slot of hooks)slot?.cleanup?.();dispose()}
  function replayEffects(){for(const slot of hooks)if(slot?.create){slot.cleanup?.();slot.cleanup=slot.create()}}
  render();
- return {requests,opened,removed,registered,timers,listeners,document,flush,text,nodes,button,click,pending,respond,tick,visible,unmount,replayEffects,
+ return {requests,opened,removed,registered,timers,listeners,document,flush,text,visibleText,nodes,button,click,pending,respond,tick,visible,unmount,replayEffects,
   count:action=>requests.filter(x=>x.action===action).length,get afterUnmount(){return afterUnmount},get focused(){return focused},get tree(){return tree}};
 }
 
@@ -308,7 +310,7 @@ test('schedule enable is explicit, sends an integer interval, and does not run i
  const save=ui.click('保存测试计划');await ui.flush();assert.deepEqual(ui.pending('pelican-configure').body,{action:'pelican-configure',enabled:true,intervalMinutes:17,model:'synthetic-model'});
  assert.equal(control(ui,'鹈鹕测试间隔').props.disabled,true);assert.equal(ui.count('pelican-run'),0);
  await ui.respond('pelican-configure',activitySnapshot({pelican:{enabled:true,intervalMinutes:17,model:'synthetic-model',nextRunAt:'2026-11-08T00:17:00Z'}}));await save;
- assert.match(ui.text(),/首次测试将在设定间隔后运行，不会立即调用模型/);assert.match(ui.text(),/当前计划：已启用/);assert.doesNotMatch(ui.text(),/计划设置尚未保存/);assert.equal(ui.count('pelican-run'),0);ui.unmount();
+ assert.match(ui.text(),/首次测试将在设定间隔后运行，不会立即调用模型/);assert.match(ui.text(),/定时已启用/);assert.doesNotMatch(ui.text(),/计划设置尚未保存/);assert.equal(ui.count('pelican-run'),0);ui.unmount();
 });
 
 for(const interval of ['','0','-1','1.5','10081','not-a-number'])test('schedule rejects invalid interval '+JSON.stringify(interval)+' without POST',async()=>{
@@ -327,7 +329,7 @@ test('closing a schedule stays available without a valid model or execution capa
  assert.equal(ui.button('立即测试一次').props.disabled,true);assert.equal(ui.button('关闭定时').props.disabled,false);
  const close=ui.click('关闭定时');assert.deepEqual(ui.pending('pelican-configure').body,{action:'pelican-configure',enabled:false});
  await ui.respond('pelican-configure',activitySnapshot({pelican:{available:false,model:'removed-model'}}));await close;
- assert.match(ui.text(),/当前计划：关闭；当前测试：未运行/);ui.unmount();
+ assert.equal(ui.text(control(ui,'测试状态')),'定时关闭');ui.unmount();
 });
 
 test('run once uses only the chosen model and cancel does not disable the schedule',async()=>{
@@ -337,7 +339,7 @@ test('run once uses only the chosen model and cancel does not disable the schedu
  assert.equal(ui.count('pelican-configure'),0);assert.equal(ui.button('立即测试一次').props.disabled,true);assert.equal(ui.button('取消当前测试').props.disabled,false);assert.equal(ui.button('刷新状态').props.disabled,false);
  const cancel=ui.click('取消当前测试');assert.deepEqual(ui.pending('pelican-cancel').body,{action:'pelican-cancel'});
  await ui.respond('pelican-cancel',activitySnapshot({pelican:{enabled:true,model:'synthetic-model',running:false,nextRunAt:'2026-11-08T01:00:00Z'}}));await cancel;
- assert.match(ui.text(),/当前计划：已启用/);assert.match(ui.text(),/如需停止后续测试，请同时关闭计划/);assert.equal(ui.count('pelican-configure'),0);ui.unmount();
+ assert.match(ui.text(),/定时已启用/);assert.match(ui.text(),/如需停止后续测试，请同时关闭计划/);assert.equal(ui.count('pelican-configure'),0);ui.unmount();
 });
 
 test('unknown metrics stay em dashes, success never invents HTTP 200, and tables scroll horizontally',async()=>{
@@ -465,7 +467,7 @@ for(const [model,amount]of [['synthetic-cache-write-ttl-unknown',0.024],['synthe
 for(const kind of ['run','configure'])for(const outcome of ['success','error'])for(const order of ['old-first','stop-first'])test('stop preempts slow '+kind+' and ignores '+outcome+' ('+order+')',async()=>{
  const ui=await activityReady(activitySnapshot({pelican:{model:'synthetic-model'}}));if(kind==='configure')await change(ui,'启用鹈鹕定时测试',true);
  const oldOperation=ui.click(kind==='run'?'立即测试一次':'保存测试计划');await ui.flush();const old=ui.requests.at(-1),stopLabel=kind==='run'?'取消当前测试':'关闭定时';
- assert.equal(ui.button(stopLabel).props.disabled,false);if(kind==='run')assert.match(ui.text(),/当前测试：未运行/);
+ assert.equal(ui.button(stopLabel).props.disabled,false);if(kind==='run')assert.equal(ui.text(control(ui,'测试状态')),'定时关闭 · 准备中');
  const staleStopHandler=ui.button(stopLabel).props.onClick,count=ui.requests.length,stopOperation=ui.click(stopLabel);
  staleStopHandler();await ui.flush();assert.equal(ui.requests.length,count+1);const stop=ui.requests.at(-1);
  assert.deepEqual(stop.body,kind==='run'?{action:'pelican-cancel'}:{action:'pelican-configure',enabled:false});
@@ -480,7 +482,7 @@ for(const kind of ['run','configure'])for(const outcome of ['success','error'])f
   await change(ui,'鹈鹕测试间隔','23');settleOld();await oldOperation;await ui.flush();
   assert.equal(control(ui,'鹈鹕测试间隔').props.value,'23');assert.match(ui.text(),/计划设置尚未保存/);
  }
- assert.equal(control(ui,'启用鹈鹕定时测试').props.checked,false);assert.match(ui.text(),/当前计划：关闭；当前测试：未运行/);
+ assert.equal(control(ui,'启用鹈鹕定时测试').props.checked,false);assert.equal(ui.text(control(ui,'测试状态')),'定时关闭');
  assert.match(ui.text(),kind==='run'?/已请求取消当前测试/:/计划已关闭，当前测试也已取消/);assert.doesNotMatch(ui.text(),/obsolete-stop|已请求立即测试一次|计划已保存；/);
  assert.equal(ui.button('清空请求日志').props.disabled,false);ui.unmount();
 });
@@ -512,7 +514,7 @@ test('stop revision also rejects a GET started before run and cancel',async()=>{
  const run=ui.click('立即测试一次');await ui.flush();const oldRun=ui.pending('pelican-run'),stop=ui.click('取消当前测试');
  await ui.respond('pelican-cancel',activitySnapshot({pelican:{model:'synthetic-model'}}));await stop;
  oldRead.respond(activitySnapshot({pelican:{enabled:true,running:true,model:'obsolete-read'}}));oldRun.fail('obsolete-run');await run;await ui.flush();
- assert.match(ui.text(),/当前计划：关闭；当前测试：未运行/);assert.doesNotMatch(ui.text(),/obsolete-read|obsolete-run/);ui.unmount();
+ assert.equal(ui.text(control(ui,'测试状态')),'定时关闭');assert.doesNotMatch(ui.text(),/obsolete-read|obsolete-run/);ui.unmount();
 });
 
 test('unmount ignores both superseded configure and its pending stop',async()=>{
@@ -523,7 +525,70 @@ test('unmount ignores both superseded configure and its pending stop',async()=>{
 
 test('many official pricing sources stay in a collapsed accessible disclosure while the date remains visible',async()=>{
  const sources=Array.from({length:31},(_value,index)=>'https://developers.openai.com/api/docs/models/synthetic-'+index);
- const ui=await activityReady(activitySnapshot({logs:{pricing:{...pricingMetadata,sources}}})),details=control(ui,'官方价格来源');
- assert.equal(details.type,'details');assert.equal(details.props.open,undefined);assert.equal(details.children[0].type,'summary');assert.equal(ui.text(details.children[0]),'官方价目表来源（31）');
- assert.deepEqual(ui.nodes(details).filter(x=>x.type==='a').map(x=>x.props.href),sources);assert.match(ui.text(),/价目表核对日期：2026-11-08/);assert.doesNotMatch(ui.text(details),/核对日期/);ui.unmount();
+ const ui=await activityReady(activitySnapshot({logs:{pricing:{...pricingMetadata,sources}}})),details=control(ui,'统计与估算说明');
+ assert.equal(details.type,'details');assert.equal(details.props.open,undefined);assert.equal(details.children[0].type,'summary');assert.equal(ui.text(details.children[0]),'统计与估算说明 · 2026-11-08');
+ assert.deepEqual(ui.nodes(details).filter(x=>x.type==='a').map(x=>x.props.href),sources);assert.match(ui.text(),/价目表核对日期：2026-11-08/);assert.match(ui.visibleText(),/2026-11-08/);ui.unmount();
+});
+
+for(const status of [401,403,404,500,502,503])test('non-JSON HTTP '+status+' remains diagnosable without response text on both GET APIs',async()=>{
+ const ui=harness();ui.pending('get').malformed(status,'<html>synthetic-private-settings</html>');ui.pending('activity-get').malformed(status,'synthetic-private-activity unauthorized');await ui.flush();
+ assert.match(ui.text(),new RegExp('状态刷新失败：api-http-'+status));assert.match(ui.text(),new RegExp('请求活动刷新失败：api-http-'+status));assert.doesNotMatch(ui.text(),/synthetic-private|<html>|unauthorized|SyntaxError/);
+ assert.equal(ui.button('刷新状态').props.disabled,false);ui.unmount();
+});
+
+for(const status of [200,204])test('invalid JSON in HTTP '+status+' gets a safe parse error without claiming success',async()=>{
+ const ui=harness();ui.pending('get').malformed(status,'synthetic-private-success-body');ui.pending('activity-get').malformed(status,'synthetic-private-success-body');await ui.flush();
+ assert.match(ui.text(),/状态刷新失败：api-invalid-json/);assert.match(ui.text(),/请求活动刷新失败：api-invalid-json/);assert.doesNotMatch(ui.text(),/synthetic-private/);assert.equal(ui.text(control(ui,'测试状态')),'读取中…');ui.unmount();
+});
+
+test('JSON API error codes remain unchanged and a non-JSON POST can safely retry',async()=>{
+ const ui=await activityReady(activitySnapshot({pelican:{model:'synthetic-model'}}));let action=ui.click('立即测试一次');ui.pending('pelican-run').respond({error:'pelican-busy'},false,409);await action;await ui.flush();
+ assert.match(ui.text(),/操作失败：pelican-busy/);assert.doesNotMatch(ui.text(),/api-http-409/);
+ action=ui.click('立即测试一次');ui.pending('pelican-run').malformed(503,'synthetic-private-post');await action;await ui.flush();
+ assert.match(ui.text(),/操作失败：api-http-503/);assert.doesNotMatch(ui.text(),/synthetic-private-post/);assert.equal(ui.button('立即测试一次').props.disabled,false);
+ action=ui.click('立即测试一次');await ui.respond('pelican-run',activitySnapshot({pelican:{running:true,model:'synthetic-model'}}));await action;
+ assert.match(ui.text(),/已请求立即测试一次/);assert.doesNotMatch(ui.text(),/api-http-503|pelican-busy/);ui.unmount();
+});
+
+test('the quota pill keeps a safe HTTP failure code above an older quota error and clears it on recovery',async()=>{
+ const ui=harness({pill:true});await ui.respond('get',snapshot({accounts:[account()],quotaError:'synthetic-old-quota-error'}));
+ ui.nodes().find(x=>x.type==='button'&&x.props.title==='查看 CPA 额度').props.onClick();await ui.flush();assert.match(ui.text(),/synthetic-old-quota-error/);
+ await ui.tick(60000);ui.pending('get').malformed(401,'synthetic-private-cookie-body');await ui.flush();assert.match(ui.text(),/额度刷新失败：api-http-401/);assert.doesNotMatch(ui.text(),/synthetic-private-cookie-body|synthetic-old-quota-error/);
+ await ui.tick(60000);await ui.respond('get',snapshot({accounts:[account()]}));assert.doesNotMatch(ui.text(),/api-http-401|额度刷新失败/);ui.unmount();
+});
+
+test('non-JSON authorization failure never opens a URL and remains retryable',async()=>{
+ const ui=await ready(),action=ui.click('添加 ChatGPT 账号');ui.pending('start').malformed(403,'synthetic-private-authorization');await action;await ui.flush();
+ assert.match(ui.text(),/api-http-403/);assert.doesNotMatch(ui.text(),/synthetic-private-authorization/);assert.equal(ui.opened.length,0);assert.equal(ui.button('添加 ChatGPT 账号').props.disabled,false);ui.unmount();
+});
+
+test('late malformed responses are still ignored after cleanup',async()=>{
+ const ui=harness(),settings=ui.pending('get'),activity=ui.pending('activity-get');ui.unmount();settings.malformed(401);activity.malformed(404);await ui.flush();assert.equal(ui.afterUnmount,0);assert.equal(ui.timers.size,0);
+});
+
+test('compact layout puts explanations behind disclosures while keeping cost, controls and labels accessible',async()=>{
+ const ui=await activityReady(activitySnapshot({logs:{pricing:pricingMetadata,summary:{total:1,pricedRequests:0,unpricedRequests:1,upperBoundRequests:0}}}));
+ const metrics=control(ui,'统计与估算说明'),probe=control(ui,'测试说明');assert.equal(metrics.type,'details');assert.equal(probe.type,'details');assert.equal(metrics.props.open,undefined);assert.equal(probe.props.open,undefined);
+ const visible=ui.visibleText();assert.match(visible,/请求记录|估算 USD/);assert.match(visible,/未知 1/);assert.match(visible,/消耗 ChatGPT 额度/);assert.match(visible,/2026-11-08/);
+ assert.doesNotMatch(visible,/仅保留内存|成功不代表 HTTP 200|已知样本|不是 ChatGPT 订阅实际账单|固定提示词：|当前计划：|当前测试：|最近请求（内存记录）|管理 ChatGPT 授权|无需本机代理进程|仅以转义文本/);
+ assert.match(ui.text(metrics),/不是 ChatGPT 订阅实际账单|缓存计费上限/);assert.match(ui.text(probe),/计划默认关闭/);assert.match(ui.text(probe),/SVG 仅以转义文本/);
+ metrics.props.open=true;assert.match(ui.visibleText(metrics),/不是 ChatGPT 订阅实际账单/);probe.props.open=true;assert.match(ui.visibleText(probe),/不保存文件、下载或浏览器持久缓存/);
+ for(const label of ['鹈鹕测试模型','鹈鹕测试间隔','启用鹈鹕定时测试'])assert.ok(ui.nodes().some(node=>node.type==='label'&&ui.nodes(node).some(child=>child.props['aria-label']===label)));
+ assert.deepEqual(ui.nodes(control(ui,'单次测试')).filter(x=>x.type==='Button').map(x=>ui.text(x)),['立即测试一次','取消当前测试']);
+ assert.deepEqual(ui.nodes(control(ui,'定时计划')).filter(x=>x.type==='Button').map(x=>ui.text(x)),['保存测试计划','关闭定时']);assert.equal(control(ui,'最近请求').type,'table');ui.unmount();
+});
+
+test('compact test state distinguishes unknown, running, stopping and the next scheduled run',async()=>{
+ const ui=await ready();assert.equal(ui.text(control(ui,'测试状态')),'读取中…');await ui.respond('activity-get',activitySnapshot({pelican:{enabled:true,running:true,model:'synthetic-model'}}));assert.equal(ui.text(control(ui,'测试状态')),'定时已启用 · 运行中');
+ const cancel=ui.click('取消当前测试');await ui.flush();assert.equal(ui.text(control(ui,'测试状态')),'定时已启用 · 停止中');
+ await ui.respond('pelican-cancel',activitySnapshot({pelican:{enabled:true,model:'synthetic-model',nextRunAt:'2026-11-08T01:00:00Z'}}));await cancel;
+ assert.match(ui.text(control(ui,'测试状态')),/^定时已启用 · 下次 /);assert.doesNotMatch(ui.text(control(ui,'测试状态')),/运行中|停止中/);ui.unmount();
+});
+
+test('v025 retains legacy stylesheet bytes and ordinary same-origin fetch options',async()=>{
+ const legacy=readFileSync(new URL('../lib/client-v024.js',import.meta.url),'utf8'),styles=value=>value.split(/\r?\n/).filter(line=>line.includes("const pillStyleId=")||line.includes("const styleId="));
+ assert.equal(styles(source).length,2);assert.deepEqual(styles(source),styles(legacy));assert.doesNotMatch(source,/__DSH_TRANSPORT__|Bearer |document\.cookie/);
+ const ui=await activityReady(activitySnapshot({pelican:{model:'synthetic-model'}})),action=ui.click('立即测试一次');const request=ui.pending('pelican-run');
+ assert.equal(request.url,'/api/cpa-activity');assert.deepEqual({...request.options.headers},{'content-type':'application/json'});assert.equal(ui.requests.some(item=>'credentials' in item.options||'mode' in item.options),false);assert.ok(ui.requests.filter(item=>!item.body).every(item=>item.options.cache==='no-store'));
+ request.respond(activitySnapshot({pelican:{model:'synthetic-model'}}));await action;ui.unmount();
 });
