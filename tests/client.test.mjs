@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v022.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v023.js',import.meta.url),'utf8');
 const snapshot=(extra={})=>({online:true,management:true,authorizationPending:false,accounts:[],models:['synthetic-model'],sync:{status:'ok',missing:[]},quotaStale:false,...extra});
 const account=(label='Synthetic account')=>({label,status:'active',quota:{plan:'Synthetic',observedAt:new Date().toISOString(),windows:[{name:'primary',minutes:300,used:42,remaining:58}]}});
 

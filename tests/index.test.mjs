@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, writeFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {apply, sameOrigin} from '../lib/index-v022.mjs';
+import {apply, sameOrigin} from '../lib/index-v023.mjs';
 
 const NOW = 2000000000000;
 const grant = id => ({kind: 'grant', payload: {access: 'synthetic-token-' + id, accountId: 'synthetic-account-' + id, expires: NOW + 3600000}});
