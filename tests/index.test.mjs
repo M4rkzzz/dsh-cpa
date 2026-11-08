@@ -755,7 +755,7 @@ test('temporary credential-store failure recovers through ordinary model listing
 });
 
 
-test('default runtime clock persists real TTFT duration and TPS after a bundled SDK stream', async t=>{
+test('one-shot default runtime clock persists explicitly local stream timing after a bundled SDK stream', async t=>{
   const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A},modelFetch:async()=>{
     const original=modelResponse(),text=await original.text(),frames=text.split('\n\n').filter(Boolean);let index=0;
     return new Response(new ReadableStream({async pull(controller){
@@ -767,6 +767,7 @@ test('default runtime clock persists real TTFT duration and TPS after a bundled 
   assert.equal((await consume(conversation(prepared))).at(-1).reason.kind,'stop');
   const activity=await f.activity(),row=activity.logs.entries[0];
   assert.equal(row.source,'conversation');assert.equal(row.usageEvidence,'provider');assert.equal(row.outputTokens,20);
+  assert.equal(row.timingVersion,2);assert.equal(row.timingSource,'stream-observer');
   assert.ok(Number.isFinite(row.ttftMs)&&row.ttftMs>=0,'default-clock TTFT is measured');
   assert.ok(Number.isFinite(row.durationMs)&&row.durationMs>row.ttftMs,'default-clock total duration is measured');
   assert.ok(Number.isFinite(row.tps)&&row.tps>0,'real output and elapsed generation produce TPS');
@@ -774,4 +775,28 @@ test('default runtime clock persists real TTFT duration and TPS after a bundled 
   assert.equal(activity.logs.summary.samples.ttft,1);assert.equal(activity.logs.summary.samples.tps,1);
   const stored=JSON.parse((await readFile(join(f.directory,'.dsh-cpa','activity.ndjson'),'utf8')).trim());
   assert.equal(stored.ttftMs,row.ttftMs);assert.equal(stored.durationMs,row.durationMs);assert.equal(stored.tps,row.tps);
+});
+
+
+test('public durable DSH events determine exact persisted timing and weighted TPS through the bundled SDK',async t=>{
+ const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A},modelFetch:async()=>modelResponse('synthetic native timing',{usage:{input_tokens:100,output_tokens:100,total_tokens:200,input_tokens_details:{cached_tokens:20,cache_write_tokens:0}}})});
+ await f.activity(); // Wait for the lazy log-store initialization, not a model request.
+ const sid='synthetic-dsh-session',session={get id(){return sid;}},bounds=[[1000,1200,2200],[5000,5200,15200]];let seq=0;
+ const event=(type,time,data)=>f.ctx.emit('session/event',session,{type,time,data,seq:seq++});
+ for(let i=0;i<bounds.length;i++){
+  const [start,first,end]=bounds[i],step=i+1;await event('step/start',start,{turn:1,step});
+  const prepared=await f.llm.prepareCall({provider:provider(A),model:MODEL});
+  const stream=prepared.stream({model:MODEL,sessionId:sid,messages:[{role:'user',content:[{type:'text',text:'synthetic native timing'}]}],tools:[],...prepared.config});
+  assert.equal((await consume(stream)).at(-1).reason.kind,'stop');
+  const before=(await readFile(join(f.directory,'.dsh-cpa','activity.ndjson'),'utf8')).trim().split('\n').filter(Boolean);assert.equal(before.length,i,'finish chunks must not persist premature observer timings');
+  await event('assistant/message',end,{turn:1,step,stream:[{type:'reasoning-chunks',time0:first,index:0,dt:[],texts:['synthetic reasoning']}],usage:{inputTokens:100,outputTokens:100,cacheReadTokens:20,cacheWriteTokens:0}});
+  const row=(await f.activity()).logs.entries[0];assert.equal(row.timingVersion,2);assert.equal(row.timingSource,'dsh-session');assert.equal(row.ttftMs,200);assert.equal(row.durationMs,end-start);assert.equal(row.decodeMs,end-first);assert.equal(row.timingOutputTokens,100);assert.equal(row.tps,i?10:100);
+ }
+ const result=await f.activity();assert.equal(result.logs.summary.avgTtftMs,200);assert.equal(result.logs.summary.avgDurationMs,5700);assert.equal(result.logs.summary.avgTps,200/11);assert.equal(result.logs.summary.samples.tps,2);
+ const saved=(await readFile(join(f.directory,'.dsh-cpa','activity.ndjson'),'utf8')).trim().split('\n').map(JSON.parse);assert.equal(saved.length,2);assert.deepEqual(saved.map(r=>r.tps),[100,10]);assert.ok(saved.every(r=>r.timingSource==='dsh-session'));
+});
+test('a session-bound call without a live step boundary never falls back to a fabricated DSH TTFT',async t=>{
+ const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A}}),prepared=await f.llm.prepareCall({provider:provider(A),model:MODEL});
+ await consume(prepared.stream({model:MODEL,sessionId:'synthetic-unseen-session',messages:[{role:'user',content:[{type:'text',text:'synthetic missing boundary'}]}],tools:[],...prepared.config}));
+ const row=(await f.activity()).logs.entries[0];assert.equal(row.timingVersion,2);assert.equal(row.timingSource,'unavailable');for(const field of ['ttftMs','durationMs','decodeMs','timingOutputTokens','tps'])assert.equal(row[field],null);
 });

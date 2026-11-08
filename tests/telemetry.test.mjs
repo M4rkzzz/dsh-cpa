@@ -89,7 +89,8 @@ test('complete prompt input, token TTFT, elapsed time and TPS use observed value
     priceModel: null, priceBasis: 'openai-standard-reference',
     status: 'success', httpStatus: null, errorCode: null, inputTokens: 100, outputTokens: 50,
     cacheHitRate: 0.6, cacheReadTokens: 60, cacheWriteTokens: 20,
-    estimatedCostUsd: null, costBasis: 'unknown', ttftMs: 100, durationMs: 1100, tps: 50});
+    estimatedCostUsd: null, costBasis: 'unknown', timingVersion: 2, timingSource: 'stream-observer',
+    ttftMs: 100, durationMs: 1100, decodeMs: 1000, timingOutputTokens: 50, tps: 50});
   assert.equal(s.summary.inputTokens, 100); assert.equal(s.summary.outputTokens, 50);
   assert.equal(s.summary.avgTtftMs, 100); assert.equal(s.summary.avgDurationMs, 1100); assert.equal(s.summary.avgTps, 50);
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
@@ -101,6 +102,7 @@ for (const first of [text('x'), {type: 'reasoning-delta', index: 0, text: 'think
   {type: 'reasoning-delta', index: 0, text: null, delta: 'thinking'},
   {type: 'tool-call-delta', index: 0, id: '', argumentsDelta: '{'},
   {type: 'tool-call-delta', index: 0, id: 'call-synthetic', argumentsDelta: '', name: 'tool'},
+  {type: 'tool-call-delta', index: 0, argumentsDelta: '', name: ''}, text(' '),
   {type: 'tool-call-delta', index: 0, id: 'call-synthetic', name: 'tool', argumentsDelta: '{'}]) {
   test('TTFT includes nonempty ' + first.type + ' ' + Object.keys(first).at(-1), async t => {
     const f = fixture(t);
@@ -151,7 +153,7 @@ test('usage/finish and empty or malformed deltas do not invent a first token', a
   const f = fixture(t);
   await collect(f.hook(options(), () => chunks(text(''), {type: 'reasoning-delta', text: false},
     {type: 'tool-call-delta', id: 'call-metadata', argumentsDelta: ''},
-    {type: 'tool-call-delta', argumentsDelta: {}, name: ''},
+    {type: 'tool-call-delta', argumentsDelta: {}, name: null},
     {type: 'tool-call-delta', arguments: 'not-a-delta-field'}, {type: 'thinking_delta', delta: 'not-the-host-protocol'},
     ...[undefined, null, '', false, 0, [], {}, {text: 'not-a-string'}].flatMap(delta => [
       {type: 'text-delta', delta}, {type: 'reasoning-delta', delta}]),
@@ -494,7 +496,7 @@ test('a failing hook disposer cannot interrupt an in-flight conversation', async
   })());
   await stream.next();
   assert.doesNotThrow(() => telemetry.dispose());
-  assert.equal(unhooks, 1); assert.equal(closed, 0); assert.equal(controller.signal.aborted, false);
+  assert.equal(unhooks, 3); assert.equal(closed, 0); assert.equal(controller.signal.aborted, false);
   assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
   assert.equal((await stream.next()).value, frame);
   await collect(stream);
@@ -804,7 +806,8 @@ test('onRecord gets one detached terminal whitelist row and never waits for disk
     'status', 'finishReason', 'httpStatus', 'errorCode', 'serviceTierRequested', 'serviceTierReported', 'usageEvidence',
     'serviceTierSent', 'serviceTierSentState', 'serviceTierReportedState', 'serviceTierReportedSource',
     'priceBasis', 'priceModel', 'cacheHitRate', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
-    'estimatedCostUsd', 'costBasis', 'ttftMs', 'durationMs', 'tps'].sort());
+    'estimatedCostUsd', 'costBasis', 'ttftMs', 'durationMs', 'tps',
+    'timingVersion', 'timingSource', 'decodeMs', 'timingOutputTokens'].sort());
   assert.equal(rows[0].status, 'success'); assert.equal(Object.hasOwn(rows[0], 'endedAt'), false);
   rows[0].status = 'fake'; rows[0].accountEmail = 'fake@example.test';
   assert.equal(f.telemetry.snapshot().entries[0].status, 'success'); assert.equal(f.telemetry.snapshot().entries[0].accountEmail, null);
@@ -987,7 +990,8 @@ test('genuine SDK SSE uses the default monotonic clock with its required Perform
   assert.equal(Number.isFinite(row.durationMs), true);
   assert.equal(Number.isFinite(row.tps), true);
   assert.ok(row.ttftMs >= 0); assert.ok(row.durationMs > row.ttftMs); assert.ok(row.durationMs <= after - before);
-  assert.equal(row.tps, row.outputTokens / ((row.durationMs - row.ttftMs) / 1000));
+  assert.equal(row.timingSource, 'stream-observer'); assert.equal(row.timingVersion, 2);
+  assert.equal(row.tps, row.timingOutputTokens / (row.decodeMs / 1000));
   assert.equal(row.outputTokens, 20); assert.equal(row.usageEvidence, 'provider');
   assert.equal(row.serviceTierRequested, 'priority'); assert.equal(row.serviceTierReported, 'default');
   assert.equal(f.rows.length, 1); assert.deepEqual(f.rows[0], row);
@@ -1048,4 +1052,19 @@ test('audit conflict also clears outbound tier and labels tier provenance as con
  a.onRequestDispatch({tier:'priority',state:'value'});b.onRequestDispatch({tier:null,state:'omitted'});
  await collect(f.hook(options(),()=>chunks(attachEvidence(text('a'),a),attachEvidence(done(),b))));
  const row=f.telemetry.snapshot().entries[0];assert.equal(row.serviceTierSent,null);assert.equal(row.serviceTierSentState,'conflict');assert.equal(row.serviceTierReportedState,'conflict');assert.equal(row.serviceTierReportedSource,null);
+});
+
+test('isolated observer TPS summary weights decode time instead of averaging row speeds', async t => {
+  const f = fixture(t);
+  for (const [start, first, end] of [[0, 100, 1100], [2000, 2100, 12100]]) {
+    f.tick(start);
+    await collect(f.hook(options(), () => (async function* () {
+      f.tick(first); yield text('first'); f.tick(end); yield usage({outputTokens: 100}); yield done();
+    })()));
+  }
+  const s = f.telemetry.snapshot();
+  assert.deepEqual(s.entries.map(row => row.tps), [10, 100]);
+  assert.deepEqual(s.entries.map(row => row.timingSource), ['stream-observer', 'stream-observer']);
+  assert.equal(s.summary.avgTps, 200 / 11); assert.equal(s.summary.samples.tps, 2);
+  assert.notEqual(s.summary.avgTps, 55);
 });

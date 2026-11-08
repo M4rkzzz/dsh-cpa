@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v0210.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v0211.js',import.meta.url),'utf8');
 const MODEL='synthetic-model', A='a', B='b', email=id=>id+'@example.test', provider=id=>'cpa-codex-'+id;
 const account=(id=A,extra={})=>({id,provider:provider(id),email:email(id),owned:id!==A,enabled:id===A,
  availability:'ready',canRunProbe:id===A,models:[MODEL,'other-model'],quota:{windows:[
@@ -15,6 +15,7 @@ const settings=(extra={})=>({online:true,management:true,authorizationPending:fa
 const logRow=(extra={})=>({id:'request-a',source:'conversation',startedAt:'2026-11-08T00:01:00Z',accountId:A,accountEmail:email(A),
  provider:provider(A),model:MODEL,status:'success',finishReason:'stop',httpStatus:200,errorCode:null,inputTokens:100,outputTokens:20,
  cacheReadTokens:10,cacheWriteTokens:null,cacheHitRate:.1,ttftMs:12,durationMs:220,tps:96.15,
+ timingVersion:2,timingSource:'dsh-session',decodeMs:208,timingOutputTokens:20,
  estimatedCostUsd:.001,costBasis:'estimate',priceBasis:'openai-standard-reference',priceModel:'synthetic-price',
  serviceTierRequested:'priority',serviceTierSent:'priority',serviceTierSentState:'value',serviceTierReported:'default',serviceTierReportedState:'value',serviceTierReportedSource:'response.completed',usageEvidence:'provider',...extra});
 const activity=(extra={})=>({accounts:[{id:A,pelican:{available:true,running:false,intervalMinutes:0,model:'',nextRunAt:null,lastError:null,historyCount:0}},
@@ -410,4 +411,26 @@ test('an omitted terminal tier is not displayed as an inherited interim default'
 test('an interim tier remains explicitly provisional and never says that Fast was rejected',async()=>{
  const ui=await harness().ready(settings(),withLogs({entries:[logRow({serviceTierReported:'auto',serviceTierReportedSource:'response.created'})]}));
  assert.match(ui.text(ui.all(n=>n.type==='tbody')[0]),/auto（中间事件）/);assert.equal(ui.text().includes('Fast 已被降级'),false);ui.unmount();
+});
+
+
+test('TTFT and elapsed rows and summary convert milliseconds to seconds once',async()=>{
+ const logs=withLogs({entries:[logRow({ttftMs:200,durationMs:3200,decodeMs:2000,timingOutputTokens:120,tps:60})],summary:{...activity().logs.summary,avgTtftMs:200,avgDurationMs:3200,avgTps:60}});
+ const ui=await harness().ready(settings(),logs),cells=ui.all(n=>n.type==='td');
+ assert.equal(ui.text(cells[9]),'0.200');assert.equal(ui.text(cells[10]),'3.200');assert.equal(ui.text(cells[11]),'60');
+ assert.match(ui.text(),/TTFT \(s\)/);assert.match(ui.text(),/耗时 \(s\)/);assert.match(ui.text(),/TPS \(token\/s\)/);
+ assert.match(ui.text(),/0.200 s/);assert.match(ui.text(),/3.200 s/);assert.equal(ui.text().includes(' ms'),false);
+ assert.match(cells[9].props.title,/DSH 原生步骤时间/);ui.unmount();
+});
+test('known zero uses seconds and long durations never switch to minute units',async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({ttftMs:0,durationMs:125650})]})),cells=ui.all(n=>n.type==='td');
+ assert.equal(ui.text(cells[9]),'0.000');assert.equal(ui.text(cells[10]),'125.650');ui.unmount();
+});
+for(const extra of [{timingVersion:undefined,timingSource:undefined},{timingVersion:2,timingSource:'unavailable'},{timingVersion:2,timingSource:'legacy'}])test('unknown or legacy timing is never rebranded as accurate seconds: '+JSON.stringify(extra),async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({...extra,ttftMs:99999,durationMs:999999,tps:99999999})]})),cells=ui.all(n=>n.type==='td');
+ for(const i of [9,10,11])assert.equal(ui.text(cells[i]),'—');ui.unmount();
+});
+test('one-shot timing is explicitly labelled local rather than native DSH',async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({source:'pelican',timingSource:'stream-observer'})]}));
+ assert.match(ui.all(n=>n.type==='td')[9].props.title,/独立请求的本地流时间/);assert.match(ui.text(),/总输出 ÷ 总解码时间加权/);ui.unmount();
 });

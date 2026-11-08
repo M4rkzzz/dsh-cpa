@@ -13,7 +13,8 @@ const row = (number = 0, extra = {}) => ({startedAt: '2026-11-08T10:00:00.000Z',
   provider: 'openai-codex', model: 'gpt-5', accountId: 'account-a', accountEmail: 'synthetic@example.invalid',
   source: 'conversation', status: 'success', finishReason: 'stop', errorCode: null, httpStatus: 200,
   usageEvidence: 'provider', inputTokens: 100, outputTokens: number, cacheReadTokens: 20, cacheWriteTokens: null,
-  cacheHitRate: 0.2, ttftMs: 20, durationMs: 100, tps: 10, priceBasis: 'openai-standard-reference',
+  cacheHitRate: 0.2, ttftMs: 20, durationMs: 100, decodeMs: 80, timingOutputTokens: number, tps: number / .08,
+  timingVersion: 2, timingSource: 'stream-observer', priceBasis: 'openai-standard-reference',
   priceModel: 'gpt-5', costBasis: 'estimate', estimatedCostUsd: 0.001, serviceTierRequested: 'priority',
   serviceTierReported: null, ...extra});
 const fileFor = root => path.join(root, '.dsh-cpa', 'activity.ndjson');
@@ -177,10 +178,10 @@ test('captures detached data at append call and preserves serialization order', 
 test('summary preserves known zero, unknown samples, cache totals and restart arithmetic', async t => {
   const f = await fixture(t);
   await f.store.append(row(0, {inputTokens: null, cacheReadTokens: null, cacheWriteTokens: null,
-    outputTokens: null, estimatedCostUsd: null, ttftMs: null, tps: null, durationMs: null, cacheHitRate: null}));
+    outputTokens: null, estimatedCostUsd: null, ttftMs: null, tps: null, durationMs: null, decodeMs: null, timingOutputTokens: null, cacheHitRate: null}));
   assert.equal(f.store.snapshot().summary.inputTokens, null);
   await f.store.append(row(0, {inputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0, estimatedCostUsd: 0,
-    durationMs: 0, ttftMs: 0, tps: 0, cacheHitRate: null}));
+    durationMs: 0, ttftMs: 0, decodeMs: 0, tps: null, cacheHitRate: null}));
   await f.store.append(row(20, {costBasis: 'upper-bound', status: 'error', errorCode: 'RATE_LIMIT'}));
   const s = f.store.snapshot().summary;
   assert.equal(s.total, 3); assert.equal(s.running, 0); assert.equal(s.error, 1); assert.equal(s.success, 2);
@@ -189,7 +190,7 @@ test('summary preserves known zero, unknown samples, cache totals and restart ar
   assert.equal(s.cacheReadTokens, 20); assert.equal(s.samples.cacheReadTokens, 2);
   assert.equal(s.cacheWriteTokens, 0); assert.equal(s.samples.cacheWriteTokens, 1);
   assert.equal(s.pricedRequests, 2); assert.equal(s.unpricedRequests, 1); assert.equal(s.upperBoundRequests, 1);
-  assert.equal(s.avgTtftMs, 10); assert.equal(s.avgDurationMs, 50); assert.equal(s.avgTps, 5);
+  assert.equal(s.avgTtftMs, 10); assert.equal(s.avgDurationMs, 50); assert.equal(s.avgTps, 250);
   await f.store.dispose();
   const restored = f.open(); await restored.ready;
   assert.deepEqual(restored.snapshot().summary, s);
@@ -742,4 +743,33 @@ test('persists only bounded tier provenance enums and keeps legacy missing prove
  assert.equal(saved[1].serviceTierSent,'priority');assert.equal(saved[1].serviceTierSentState,'value');assert.equal(saved[1].serviceTierReportedState,'missing');assert.equal(saved[1].serviceTierReportedSource,'response.completed');
  for(const field of ['serviceTierSent','serviceTierSentState','serviceTierReportedState','serviceTierReportedSource'])assert.equal(saved[0][field],null);
  assert.equal(JSON.stringify(saved).includes('PRIVATE-'),false);
+});
+
+
+test('persistent TPS is sum decode output divided by sum decode time, not mean of per-row speeds',async t=>{
+ const f=await fixture(t);
+ await f.store.append(row(100,{timingSource:'dsh-session',ttftMs:200,durationMs:1200,decodeMs:1000,timingOutputTokens:100,tps:999999}));
+ await f.store.append(row(100,{timingSource:'dsh-session',ttftMs:200,durationMs:10200,decodeMs:10000,timingOutputTokens:100,tps:999999}));
+ const page=await f.store.page();assert.deepEqual(page.entries.map(r=>r.tps),[10,100]);assert.equal(f.store.snapshot().summary.avgTps,200/11);assert.equal(f.store.snapshot().summary.samples.tps,2);
+ await f.store.dispose();const reopened=f.open();await reopened.ready;assert.equal(reopened.snapshot().summary.avgTps,200/11);
+});
+test('zero decode pairs follow native DSH totals but never invent an individual infinite speed',async t=>{
+ const f=await fixture(t);
+ await f.store.append(row(100,{ttftMs:200,durationMs:200,decodeMs:0,timingOutputTokens:100}));
+ assert.equal((await f.store.page()).entries[0].tps,null);assert.equal(f.store.snapshot().summary.avgTps,null);
+ await f.store.append(row(100,{ttftMs:200,durationMs:1200,decodeMs:1000,timingOutputTokens:100}));
+ assert.equal(f.store.snapshot().summary.avgTps,200);assert.equal(f.store.snapshot().summary.samples.tps,2);
+});
+test('legacy disk timings are unknown without rewriting or fabricating native history',async t=>{
+ const f=await fixture(t);await f.store.append(row(100));await f.store.dispose();
+ const old=JSON.parse((await fs.readFile(f.file,'utf8')).trim());for(const key of ['timingVersion','timingSource','decodeMs','timingOutputTokens'])delete old[key];old.ttftMs=1;old.durationMs=2;old.tps=100000;
+ const original=JSON.stringify(old)+'\n';await fs.writeFile(f.file,original);const restored=f.open();await restored.ready;
+ const saved=(await restored.page()).entries[0];assert.equal(saved.timingSource,'legacy');assert.equal(saved.timingVersion,null);
+ for(const key of ['ttftMs','durationMs','decodeMs','timingOutputTokens','tps'])assert.equal(saved[key],null);
+ assert.equal(restored.snapshot().summary.avgTps,null);assert.equal(saved.outputTokens,100);assert.equal(await fs.readFile(f.file,'utf8'),original);
+});
+test('timing provenance ignores unsafe versions and unknown sources without accepting injected speed',async t=>{
+ const f=await fixture(t);
+ for(const extra of [{timingVersion:'2'},{timingVersion:3},{timingSource:'PRIVATE-TIMING'},{timingSource:'unavailable'},{ttftMs:null}])await f.store.append(row(100,{tps:999999,...extra}));
+ const entries=(await f.store.page()).entries;for(const r of entries)assert.equal(r.tps,null);assert.equal(JSON.stringify(entries).includes('PRIVATE-TIMING'),false);assert.equal(f.store.snapshot().summary.avgTps,null);
 });

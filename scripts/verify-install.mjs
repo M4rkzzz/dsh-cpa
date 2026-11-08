@@ -24,6 +24,6 @@ try{
  await mkdir(join(installed,'tests'),{recursive:true});
  await cp(join(repo,'tests'),join(installed,'tests'),{recursive:true});
  // Host AuthorizationService is a development test fixture, not a consumer dependency.
- const summary=run(['--test','--experimental-test-isolation=none','tests/index.test.mjs','tests/client.test.mjs','tests/transport.test.mjs','tests/tier-wire.test.mjs','tests/evidence.test.mjs','tests/png.test.mjs','tests/sdk-bundle.test.mjs','tests/upgrade.test.mjs'],installed).split('\n').filter(line=>/tests |pass |fail |skipped |duration_ms /.test(line)).slice(-5);
+ const summary=run(['--test','--experimental-test-isolation=none','tests/index.test.mjs','tests/client.test.mjs','tests/telemetry.test.mjs','tests/log-store.test.mjs','tests/transport.test.mjs','tests/tier-wire.test.mjs','tests/evidence.test.mjs','tests/png.test.mjs','tests/sdk-bundle.test.mjs','tests/upgrade.test.mjs'],installed).split('\n').filter(line=>/tests |pass |fail |skipped |duration_ms /.test(line)).slice(-5);
  console.log(JSON.stringify({node:process.version,pnpm:'11.28.5',strictDepBuilds:true,allowBuilds:{},ignoreScripts:false,installedVersion:JSON.parse(await readFile(join(installed,'package.json'),'utf8')).version,installedIntegrationSuite:summary}));
 }finally{assert.equal(dirname(dir),tmpdir());assert.ok(basename(dir).startsWith('cpa-strict-install-'));await rm(dir,{recursive:true,force:true,maxRetries:3});}

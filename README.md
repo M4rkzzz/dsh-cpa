@@ -4,6 +4,14 @@ Isolated ChatGPT Codex accounts, quota, real Fast, persistent request metadata a
 
 Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. The GitHub channel detects version bumps on the default branch without requiring a GitHub Release.
 
+## 0.2.11
+
+- Ordinary conversations use **native DSH step events and first-token timestamps**, not observer-side timing presented as host metrics. Preparation/retry semantics follow DSH, and timing is persisted only after durable assistant settlement.
+- Aggregate TPS is **total output tokens / total decode seconds**, never an arithmetic mean of per-row rates. Reasoning and tool deltas use the native first-token definition without double-counting output.
+- **TTFT and elapsed time display seconds (s)**; TPS remains token/s. Independent pelican probes explicitly identify local stream timing.
+- Legacy timing has no native evidence: it is not backfilled or included in new speed statistics. Other logs, usage and PNGs are preserved; missing boundaries/tokens remain unknown.
+- Verification uses isolated synthetic streams compared event-by-event with the actual public DSH sessionStats projection, without production configuration changes or real model probes.
+
 ## 0.2.10
 
 - Separate Fast **preference / dispatched tier / raw response field**. Dispatch evidence is captured at the final local transport boundary, never inferred from the toggle preference.
