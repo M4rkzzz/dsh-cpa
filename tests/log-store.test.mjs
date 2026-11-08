@@ -732,3 +732,14 @@ test('empty-file clear works without replacing its inode on Windows append handl
   assert.equal(f.store.snapshot().storage.available, true);
   await f.store.append(row(1)); assert.equal(f.store.snapshot().summary.total, 1);
 });
+
+
+test('persists only bounded tier provenance enums and keeps legacy missing provenance unknown',async t=>{
+ const f=await fixture(t);
+ await f.store.append(row(0,{serviceTierSent:'priority',serviceTierSentState:'value',serviceTierReported:null,serviceTierReportedState:'missing',serviceTierReportedSource:'response.completed'}));
+ await f.store.append(row(1,{serviceTierSent:'PRIVATE-TIER',serviceTierSentState:'PRIVATE-STATE',serviceTierReportedState:'PRIVATE-STATE',serviceTierReportedSource:'PRIVATE-RAW-EVENT'}));
+ const saved=(await f.store.page()).entries;
+ assert.equal(saved[1].serviceTierSent,'priority');assert.equal(saved[1].serviceTierSentState,'value');assert.equal(saved[1].serviceTierReportedState,'missing');assert.equal(saved[1].serviceTierReportedSource,'response.completed');
+ for(const field of ['serviceTierSent','serviceTierSentState','serviceTierReportedState','serviceTierReportedSource'])assert.equal(saved[0][field],null);
+ assert.equal(JSON.stringify(saved).includes('PRIVATE-'),false);
+});

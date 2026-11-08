@@ -9,6 +9,7 @@ import LlmRuntime, {LlmAdapter, LlmError, attributionHeaders, createAssistantMes
 import {createCpaTransport} from '../lib/transport-v026.mjs';
 import {readEvidence} from '../lib/evidence-v026.mjs';
 import {createTelemetry} from '../lib/telemetry-v026.mjs';
+import {TIER_WIRE_MAX_BYTES} from '../lib/tier-wire-v0210.mjs';
 
 const MODEL = 'gpt-5.5';
 const A = '11111111-1111-4111-8111-111111111111';
@@ -97,7 +98,7 @@ async function fixture(t, options = {}) {
   return {ctx, llm, transport, telemetry, ...account, calls, registered, registrations, observed, host, setFast: value => {fast = value;}};
 }
 
-test('public PiAiAdapter delegate sends priority ON and omits service_tier OFF on the same owned SSE route', async t => {
+test('isolated Fast ON/OFF serializes final priority/omitted bodies against a synthetic default server only', async t => {
   const f = await fixture(t);
   const rawFetch = globalThis.fetch;
   const offChunks = await collect(f.transport.stream(A, request()));
@@ -111,6 +112,8 @@ test('public PiAiAdapter delegate sends priority ON and omits service_tier OFF o
   assert.equal(offChunks.find(chunk => chunk.type === 'text-delta').text, 'synthetic answer');
   const offEvidence = readEvidence(offChunks.at(-1));
   assert.equal(offEvidence.httpStatus, 200); assert.equal(offEvidence.serviceTierRequested, null);
+  assert.equal(offEvidence.serviceTierSent, null); assert.equal(offEvidence.serviceTierSentState, 'omitted');
+  assert.equal(offEvidence.serviceTierReportedState, 'value'); assert.equal(offEvidence.serviceTierReportedSource, 'response.completed');
   assert.equal(offEvidence.serviceTierReported, 'default'); assert.equal(offEvidence.inputTokens, 41);
   assert.equal(offEvidence.cacheReadTokens, 11); assert.equal(offEvidence.accountId, A);
   f.setFast(true);
@@ -120,11 +123,65 @@ test('public PiAiAdapter delegate sends priority ON and omits service_tier OFF o
   assert.equal(f.calls[1].body.temperature, 0.3);
   const onEvidence = readEvidence(onChunks.at(-1));
   assert.equal(onEvidence.serviceTierRequested, 'priority');
-  assert.equal(onEvidence.serviceTierReported, 'default'); // Requested is NOT evidence of served tier.
+  assert.equal(onEvidence.serviceTierSent, 'priority'); assert.equal(onEvidence.serviceTierSentState, 'value');
+  assert.equal(onEvidence.serviceTierReportedState, 'value'); assert.equal(onEvidence.serviceTierReportedSource, 'response.completed');
+  assert.equal(onEvidence.serviceTierReported, 'default'); // Synthetic only: no evidence of upstream acceptance or downgrade.
+  for (const call of f.calls) {
+    assert.equal([...new Headers(call.init.headers).keys()].some(key => /routing.?hint/i.test(key)), false);
+    assert.equal(call.init.redirect, 'error');
+    assert.equal(typeof call.init.body === 'string' || call.init.body instanceof Uint8Array, true);
+  }
   assert.notEqual(onEvidence.evidenceId, offEvidence.evidenceId);
   assert.equal(globalThis.fetch, rawFetch);
   assert.equal(f.registered.get('openai-codex'), f.host);
   assert.deepEqual([...f.observed].sort(), [provider(A), provider(B)].sort());
+});
+
+test('terminal synthetic reports clear created tiers instead of retaining stale evidence', async t => {
+  for (const [tier, state] of [[undefined, 'missing'], [null, 'null'], ['synthetic-unknown-tier', 'invalid']]) {
+    const values = events('synthetic answer', {service_tier: tier});
+    values[0].response.service_tier = 'priority';
+    const f = await fixture(t, {fast: true, fetchImpl: () => responseFor(values)});
+    const chunks = await collect(f.transport.stream(A, request()));
+    assert.equal(chunks.at(-1).reason.kind, 'stop');
+    assert.equal(f.calls[0].body.service_tier, 'priority');
+    const evidence = readEvidence(chunks.at(-1));
+    assert.equal(evidence.serviceTierSent, 'priority'); assert.equal(evidence.serviceTierSentState, 'value');
+    assert.equal(evidence.serviceTierReported, null); assert.equal(evidence.serviceTierReportedState, state);
+    assert.equal(evidence.serviceTierReportedSource, 'response.completed');
+    assert.equal(JSON.stringify(evidence).includes('synthetic-unknown-tier'), false);
+  }
+});
+
+test('observation limits never block an oversized synthetic SDK request or rewrite its Fast body', async t => {
+  const f = await fixture(t, {fast: true});
+  const text = 'synthetic oversized input ' + 'x'.repeat(TIER_WIRE_MAX_BYTES);
+  const chunks = await collect(f.transport.stream(A, request({messages: [{role: 'user', content: [{type: 'text', text}]}]})));
+  assert.equal(chunks.at(-1).reason.kind, 'stop'); assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].body.service_tier, 'priority');
+  assert.ok(f.calls[0].body.input.some(item => item.content?.some(part => part.text === text)));
+  const evidence = readEvidence(chunks.at(-1));
+  assert.equal(evidence.serviceTierRequested, 'priority');
+  assert.equal(evidence.serviceTierSent, null); assert.equal(evidence.serviceTierSentState, 'unavailable');
+  assert.equal(evidence.serviceTierReported, 'default'); // The server is synthetic, not evidence of a real downgrade.
+});
+
+test('Fast remains a frozen isolated selection even when policy or SDK options prevent dispatch', async t => {
+  let enabled = true;
+  const f = await fixture(t, {fast: true, isEnabled: () => enabled});
+  const unsupported = await collect(f.transport.stream(A, request({stop: ['unsupported']})));
+  const rejected = readEvidence(unsupported.at(-1));
+  assert.equal(unsupported.at(-1).reason.failure.code, 'UNSUPPORTED_OPTION');
+  assert.equal(rejected.serviceTierRequested, 'priority');
+  assert.equal(rejected.serviceTierSent, null); assert.equal(rejected.serviceTierSentState, 'not-sent');
+  const prepared = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  enabled = false;
+  const failed = await collect(prepared.stream({...request(), ...prepared.config}));
+  const guarded = readEvidence(failed.at(-1));
+  assert.equal(failed.at(-1).reason.failure.code, 'CPA_ACCOUNT_INACTIVE');
+  assert.equal(guarded.serviceTierRequested, 'priority');
+  assert.equal(guarded.serviceTierSent, null); assert.equal(guarded.serviceTierSentState, 'not-sent');
+  assert.equal(f.calls.length, 0);
 });
 
 test('core prepared calls freeze Fast and retain a stable account wrapper across refresh', async t => {
@@ -135,6 +192,8 @@ test('core prepared calls freeze Fast and retain a stable account wrapper across
   const chunks = await collect(prepared.stream({...request(), ...prepared.config}));
   assert.equal(chunks.at(-1).reason.kind, 'stop');
   assert.equal(f.calls[0].body.service_tier, 'priority');
+  assert.equal(readEvidence(chunks.at(-1)).serviceTierSent, 'priority');
+  assert.equal(readEvidence(chunks.at(-1)).serviceTierSentState, 'value');
   assert.equal(f.registered.get(provider(A)), wrapper);
   await collect(f.transport.stream(A, request()));
   assert.equal(Object.hasOwn(f.calls[1].body, 'service_tier'), false);
@@ -299,6 +358,8 @@ test('real HTTP error status remains request-local and missing raw usage remains
   const proof = readEvidence(chunks.at(-1));
   assert.equal(proof.httpStatus, 403); assert.equal(proof.usageReported, false); assert.equal(proof.inputTokens, null);
   assert.equal(proof.serviceTierReported, null);
+  assert.equal(proof.serviceTierSent, null); assert.equal(proof.serviceTierSentState, 'omitted');
+  assert.equal(proof.serviceTierReportedState, null); assert.equal(proof.serviceTierReportedSource, null);
 });
 
 test('same model and shared AbortSignal never correlate separate delegate audits', async t => {
@@ -318,6 +379,8 @@ test('prepared identity change fails closed and same-principal access-token rota
   f.state.get(A).hash = 'changed';
   const failed = await collect(prepared.stream({...request(), ...prepared.config}));
   assert.equal(failed.at(-1).reason.kind, 'error'); assert.equal(f.calls.length, 0);
+  assert.equal(readEvidence(failed.at(-1)).serviceTierSent, null);
+  assert.equal(readEvidence(failed.at(-1)).serviceTierSentState, 'not-sent');
   f.state.get(A).hash = 'principal-' + A;
   const next = await f.llm.prepareCall({provider: provider(A), model: MODEL});
   f.state.get(A).credential.access = token(A, 2);
@@ -407,7 +470,9 @@ test('unknown models, foreign routes and SDK-unsupported options fail without pr
   assert.throws(() => f.transport.providerFor('../account'), {code: 'CPA_ACCOUNT_INVALID'});
   const chunks = await collect(f.transport.stream(A, request({stop: ['unsupported']})));
   assert.equal(chunks.at(-1).reason.failure.code, 'UNSUPPORTED_OPTION');
-  assert.equal(readEvidence(chunks.at(-1)).httpStatus, null); assert.equal(f.calls.length, 0);
+  const evidence = readEvidence(chunks.at(-1));
+  assert.equal(evidence.httpStatus, null); assert.equal(f.calls.length, 0);
+  assert.equal(evidence.serviceTierSent, null); assert.equal(evidence.serviceTierSentState, 'not-sent');
 });
 
 test('catalog sync is additive across refreshes and never inherits prior-principal remote metadata', async t => {
@@ -566,6 +631,8 @@ test('switching from A to B invalidates an unstarted A prepared call without red
   const refused = await collect(old.stream(options));
   assert.equal(refused.at(-1).reason.failure.code, 'CPA_ACCOUNT_INACTIVE'); assert.equal(f.calls.length, 0);
   assert.equal(options.provider, provider(A)); assert.equal(readEvidence(refused.at(-1)).accountId, A);
+  assert.equal(readEvidence(refused.at(-1)).serviceTierSent, null);
+  assert.equal(readEvidence(refused.at(-1)).serviceTierSentState, 'not-sent');
   const next = await collect(f.transport.stream(B, request()));
   assert.equal(next.at(-1).reason.kind, 'stop'); assert.equal(f.calls.length, 1);
   assert.equal(new Headers(f.calls[0].init.headers).get('chatgpt-account-id'), 'upstream-' + B);
@@ -618,6 +685,8 @@ test('requestGuard rechecks policy after an awaited identity assertion before an
   await entered.promise; enabled = B; gate.resolve();
   const chunks = await pending;
   assert.equal(chunks.at(-1).reason.failure.code, 'CPA_ACCOUNT_INACTIVE'); assert.equal(f.calls.length, 0);
+  assert.equal(readEvidence(chunks.at(-1)).serviceTierSent, null);
+  assert.equal(readEvidence(chunks.at(-1)).serviceTierSentState, 'not-sent');
 });
 
 test('native fetch policy guard closes the gap after scoped authentication resolves', async t => {
@@ -628,6 +697,8 @@ test('native fetch policy guard closes the gap after scoped authentication resol
   }};};
   const chunks = await collect(f.transport.stream(A, request()));
   assert.equal(chunks.at(-1).reason.failure.code, 'CPA_ACCOUNT_INACTIVE'); assert.equal(f.calls.length, 0);
+  assert.equal(readEvidence(chunks.at(-1)).serviceTierSent, null);
+  assert.equal(readEvidence(chunks.at(-1)).serviceTierSentState, 'not-sent');
 });
 
 test('native response guard rejects and reclaims a body if its account became inactive during fetch', async t => {

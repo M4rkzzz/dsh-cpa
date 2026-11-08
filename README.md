@@ -4,6 +4,13 @@ Isolated ChatGPT Codex accounts, quota, real Fast, persistent request metadata a
 
 Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. The GitHub channel detects version bumps on the default branch without requiring a GitHub Release.
 
+## 0.2.10
+
+- Separate Fast **preference / dispatched tier / raw response field**. Dispatch evidence is captured at the final local transport boundary, never inferred from the toggle preference.
+- Preserve response-event source and presence. A terminal event without a tier no longer inherits an interim default/auto value. Legacy provenance remains unknown.
+- **Codex response `service_tier=default` does not prove Fast was ignored**; it is not an end-to-end routing receipt. A short latency comparison is not such proof either. See the [upstream repository contributor explanation](https://github.com/openai/codex/issues/14204#issuecomment-4033184620).
+- Fast ON/OFF is tested in isolated configurations, not by changing production settings or inventing mandatory headers/feature flags.
+
 ## 0.2.9
 
 - Fast is a native checkbox switch with a visible track/thumb, keyboard interaction, pending feedback and actionable unavailable messages.

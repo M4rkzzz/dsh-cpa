@@ -280,6 +280,10 @@ test('Fast is an acknowledged durable preference and changes the actual owned re
   assert.equal(JSON.parse(await readFile(join(f.directory, 'preferences.json'), 'utf8')).fastEnabled, true);
   await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL}); await settle(f, id, 2);
   assert.equal(f.modelCalls[1].body.service_tier, 'priority');
+  const evidence=(await f.activity()).logs.entries;
+  assert.equal(evidence[0].serviceTierSent,'priority');assert.equal(evidence[0].serviceTierSentState,'value');
+  assert.equal(evidence[0].serviceTierReported,'default');assert.equal(evidence[0].serviceTierReportedState,'value');assert.equal(evidence[0].serviceTierReportedSource,'response.completed');
+  assert.equal(evidence[1].serviceTierSent,null);assert.equal(evidence[1].serviceTierSentState,'omitted');
   assert.ok(f.settingsWrites.every(ops => ops.every(op => ['fastEnabled', 'plans', 'activeAccountId'].includes(op.path[0]))));
 });
 

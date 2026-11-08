@@ -85,6 +85,7 @@ test('complete prompt input, token TTFT, elapsed time and TPS use observed value
   assert.deepEqual(e, {id: 'cpa-1', source: 'conversation', provider: 'openai-codex', model: 'synthetic-model',
     accountId: null, accountEmail: null, startedAt: '1970-01-01T00:00:00.000Z',
     finishReason: 'stop', usageEvidence: 'host-normalized', serviceTierRequested: null, serviceTierReported: null,
+    serviceTierSent: null, serviceTierSentState: null, serviceTierReportedState: null, serviceTierReportedSource: null,
     priceModel: null, priceBasis: 'openai-standard-reference',
     status: 'success', httpStatus: null, errorCode: null, inputTokens: 100, outputTokens: 50,
     cacheHitRate: 0.6, cacheReadTokens: 60, cacheWriteTokens: 20,
@@ -801,6 +802,7 @@ test('onRecord gets one detached terminal whitelist row and never waits for disk
   await collect(stream); assert.equal(rows.length, 1);
   assert.deepEqual(Object.keys(rows[0]).sort(), ['id', 'source', 'startedAt', 'provider', 'model', 'accountId', 'accountEmail',
     'status', 'finishReason', 'httpStatus', 'errorCode', 'serviceTierRequested', 'serviceTierReported', 'usageEvidence',
+    'serviceTierSent', 'serviceTierSentState', 'serviceTierReportedState', 'serviceTierReportedSource',
     'priceBasis', 'priceModel', 'cacheHitRate', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
     'estimatedCostUsd', 'costBasis', 'ttftMs', 'durationMs', 'tps'].sort());
   assert.equal(rows[0].status, 'success'); assert.equal(Object.hasOwn(rows[0], 'endedAt'), false);
@@ -1029,4 +1031,21 @@ test('genuine SDK completed blocks and raw usage never backdate a missing first 
   const f = await sdkTiming(t, {emitDelta: false}), row = f.telemetry.snapshot().entries[0];
   assert.equal(row.outputTokens, 20); assert.equal(row.ttftMs, null); assert.equal(row.tps, null);
   assert.equal(f.telemetry.snapshot().summary.samples.ttft, 0);
+});
+
+
+test('tier intent, dispatched bytes, and terminal field provenance remain independent display metadata',async t=>{
+ const f=fixture(t),audit=createEvidence({serviceTierRequested:'priority'});
+ audit.onRequestDispatch({tier:'priority',state:'value'});
+ audit.onRawEvent({type:'response.created',response:{service_tier:'default'}});
+ audit.onRawEvent({type:'response.completed',response:{usage:{input_tokens:10,output_tokens:2}}});
+ await collect(f.hook(options(),()=>chunks(attachEvidence(done(),audit))));
+ const row=f.telemetry.snapshot().entries[0];assert.equal(row.serviceTierRequested,'priority');assert.equal(row.serviceTierSent,'priority');assert.equal(row.serviceTierSentState,'value');
+ assert.equal(row.serviceTierReported,null);assert.equal(row.serviceTierReportedState,'missing');assert.equal(row.serviceTierReportedSource,'response.completed');
+});
+test('audit conflict also clears outbound tier and labels tier provenance as conflicted',async t=>{
+ const f=fixture(t),a=createEvidence({serviceTierRequested:'priority'}),b=createEvidence({serviceTierRequested:'default'});
+ a.onRequestDispatch({tier:'priority',state:'value'});b.onRequestDispatch({tier:null,state:'omitted'});
+ await collect(f.hook(options(),()=>chunks(attachEvidence(text('a'),a),attachEvidence(done(),b))));
+ const row=f.telemetry.snapshot().entries[0];assert.equal(row.serviceTierSent,null);assert.equal(row.serviceTierSentState,'conflict');assert.equal(row.serviceTierReportedState,'conflict');assert.equal(row.serviceTierReportedSource,null);
 });

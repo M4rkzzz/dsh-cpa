@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v029.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v0210.js',import.meta.url),'utf8');
 const MODEL='synthetic-model', A='a', B='b', email=id=>id+'@example.test', provider=id=>'cpa-codex-'+id;
 const account=(id=A,extra={})=>({id,provider:provider(id),email:email(id),owned:id!==A,enabled:id===A,
  availability:'ready',canRunProbe:id===A,models:[MODEL,'other-model'],quota:{windows:[
@@ -16,7 +16,7 @@ const logRow=(extra={})=>({id:'request-a',source:'conversation',startedAt:'2026-
  provider:provider(A),model:MODEL,status:'success',finishReason:'stop',httpStatus:200,errorCode:null,inputTokens:100,outputTokens:20,
  cacheReadTokens:10,cacheWriteTokens:null,cacheHitRate:.1,ttftMs:12,durationMs:220,tps:96.15,
  estimatedCostUsd:.001,costBasis:'estimate',priceBasis:'openai-standard-reference',priceModel:'synthetic-price',
- serviceTierRequested:'priority',serviceTierReported:'default',usageEvidence:'provider',...extra});
+ serviceTierRequested:'priority',serviceTierSent:'priority',serviceTierSentState:'value',serviceTierReported:'default',serviceTierReportedState:'value',serviceTierReportedSource:'response.completed',usageEvidence:'provider',...extra});
 const activity=(extra={})=>({accounts:[{id:A,pelican:{available:true,running:false,intervalMinutes:0,model:'',nextRunAt:null,lastError:null,historyCount:0}},
  {id:B,pelican:{available:false,running:false,intervalMinutes:0,model:'',nextRunAt:null,lastError:null,historyCount:0}}],
  logs:{available:true,persistent:true,storage:{available:true,error:null},page:{nextCursor:null},recording:{pending:0,failed:0,error:null},entries:[],
@@ -252,7 +252,7 @@ test('log times use local today HH:mm or MM-DD, retain full start title, and nev
  const ui=await harness().ready(settings(),withLogs({entries:rows}));const dates=ui.all(n=>n.type==='time');assert.deepEqual(dates.map(n=>ui.text(n)),['00:01','11-07','11-09']);assert.ok(dates.every(n=>n.props.title.includes('2026-11-')));assert.equal(ui.text().includes('2099'),false);assert.equal(ui.text().includes('结束时间'),false);ui.unmount();
 });
 test('logs display real HTTP, separate raw cache read/write, input/output, and requested/reported tier',async()=>{
- const ui=await harness().ready(settings(),withLogs({entries:[logRow()]}));const row=ui.all(n=>n.type==='tbody')[0];assert.match(ui.text(row),/20010 \/ —10%100 \/ 20/);assert.match(ui.text(row),/priority \/ default/);assert.ok(ui.all(n=>n.type==='td'&&n.props.title==='用量来源：provider').length);assert.match(ui.text(),/缓存读 \/ 写/);assert.match(ui.text(),/标准价 USD/);ui.unmount();
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow()]}));const row=ui.all(n=>n.type==='tbody')[0];assert.match(ui.text(row),/20010 \/ —10%100 \/ 20/);assert.match(ui.text(row),/priority \/ priority \/ default/);assert.ok(ui.all(n=>n.type==='td'&&n.props.title==='用量来源：provider').length);assert.match(ui.text(),/缓存读 \/ 写/);assert.match(ui.text(),/标准价 USD/);ui.unmount();
 });
 test('missing usage and HTTP are unknown, not free or guessed from success',async()=>{
  const unknown=logRow({httpStatus:null,inputTokens:null,outputTokens:null,cacheReadTokens:null,cacheWriteTokens:null,cacheHitRate:null,estimatedCostUsd:null,costBasis:'unknown'});
@@ -368,7 +368,7 @@ for(const change of ['model','provider'])test('a pending Fast ACK cannot overwri
  await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));assert.equal(ui.selected.length,0);assert.equal(ui.fast().props.disabled,false);ui.unmount();
 });
 test('service tier label explains priority/default separately from max reasoning effort',async()=>{
- const ui=await harness().ready(settings(),withLogs({entries:[logRow()]}));assert.match(ui.text(),/服务等级：请求 \/ 返回/);assert.match(ui.text(),/max 等推理强度/);assert.match(ui.text(),/priority \/ default 表示请求加速/);ui.unmount();
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow()]}));assert.match(ui.text(),/Fast：设置 \/ 出站 \/ 响应字段/);assert.match(ui.text(),/max 等推理强度/);assert.match(ui.text(),/default 不代表 Fast 未生效/);ui.unmount();
 });
 
 
@@ -391,4 +391,23 @@ test('Fast preserves advertised max reasoning while toggling a separate service-
 test('Fast switch installs its own checked, focus and pending styles instead of inheriting button-only styling',()=>{
  const ui=harness({pill:true});assert.equal(ui.styles.length,1);const css=ui.styles[0].textContent;
  assert.match(css,/\.cpaFast_input:checked\+\.cpaFast_track/);assert.match(css,/\.cpaFast_input:focus-visible/);assert.match(css,/data-busy=true/);assert.match(css,/prefers-reduced-motion/);ui.unmount();
+});
+
+
+for(const [state,label] of [['not-sent','未提交'],['omitted','未指定'],['unavailable','未知'],['invalid','无效'],['conflict','冲突']])test('tier log labels non-value outbound evidence safely: '+state,async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({serviceTierSent:null,serviceTierSentState:state})]}));
+ const row=ui.all(n=>n.type==='tbody')[0];assert.match(ui.text(row),new RegExp('priority / '+label+' / default'));ui.unmount();
+});
+test('legacy tier rows show unknown provenance rather than fabricating dispatch evidence',async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({serviceTierSent:undefined,serviceTierSentState:undefined,serviceTierReportedState:undefined,serviceTierReportedSource:undefined})]}));
+ const row=ui.all(n=>n.type==='tbody')[0];assert.match(ui.text(row),/priority \/ — \/ default（来源未知）/);ui.unmount();
+});
+test('an omitted terminal tier is not displayed as an inherited interim default',async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({serviceTierReported:null,serviceTierReportedState:'missing',serviceTierReportedSource:'response.completed'})]}));
+ assert.match(ui.text(ui.all(n=>n.type==='tbody')[0]),/priority \/ priority \/ 未返回/);assert.match(ui.text(),/不能单独证明或否定 Codex Fast/);
+ assert.ok(ui.all(n=>n.type==='td'&&n.props.title?.includes('response.completed')).length);ui.unmount();
+});
+test('an interim tier remains explicitly provisional and never says that Fast was rejected',async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow({serviceTierReported:'auto',serviceTierReportedSource:'response.created'})]}));
+ assert.match(ui.text(ui.all(n=>n.type==='tbody')[0]),/auto（中间事件）/);assert.equal(ui.text().includes('Fast 已被降级'),false);ui.unmount();
 });

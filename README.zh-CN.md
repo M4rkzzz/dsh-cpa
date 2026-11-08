@@ -4,6 +4,13 @@ ChatGPT Codex 多账号、额度、真实 Fast、持久请求日志和纯内存�
 
 通过 DSH Market 从 [GitHub 仓库](https://github.com/M4rkzzz/dsh-cpa)安装，或安装打包归档。默认分支的版本更新即可被 GitHub 来源检测，不依赖 GitHub Release。
 
+## 0.2.10
+
+- 修正 Fast 诊断语义：日志分开显示 **设置 / 出站 / 响应字段**。出站参数在最终本地传输入口核验，不再把开关偏好当作已发送证据。
+- 标记响应字段的事件来源与缺失状态。完成事件没返回等级时，不再冒用 created 阶段的 default/auto；旧日志来源未知，不补造。
+- **Codex 的响应 `service_tier=default` 不能证明 Fast 没生效**。这是服务端路由，不是端到端 Fast 回执；只凭短次测速同样无法证明。参见 [官方仓库贡献者解释](https://github.com/openai/codex/issues/14204#issuecomment-4033184620)。
+- Fast 开／关只在隔离测试配置中对照；不修改生产开关，也不添加未经证实必需的请求头或 feature flag。
+
 ## 0.2.9
 
 - Fast 改为原生 checkbox 滑动开关，鼠标/触摸/键盘均可操作，显示保存中；不可用时点击会说明原因，而不是无响应。
