@@ -1,330 +1,166 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {mkdtemp, writeFile, rm} from 'node:fs/promises';
+import {mkdtemp, readFile, readdir, rm, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {apply, sameOrigin} from '../lib/index-v025.mjs';
+import {createHash} from 'node:crypto';
+import * as zlib from 'node:zlib';
+import {Context} from '@deepseek-ai/cordis';
+import LlmRuntime, {LlmAdapter} from '@deepseek-ai/dsh-llm';
+import {createCpaApp, Config, sameOrigin} from '../lib/index-v026.mjs';
+import {createAccounts} from '../lib/accounts-v026.mjs';
+import {createCpaTransport} from '../lib/transport-v026.mjs';
 
-const NOW = 2000000000000;
-const grant = id => ({kind: 'grant', payload: {access: 'synthetic-token-' + id, accountId: 'synthetic-account-' + id, expires: NOW + 3600000}});
-const model = (slug = 'gpt-6-synthetic') => ({slug, display_name: slug, visibility: 'list', context_window: 100000, input_modalities: ['text'], supported_reasoning_levels: [{effort: 'medium'}]});
-const quota = used => Response.json({rate_limit: {primary_window: {used_percent: used, limit_window_seconds: 18000}}});
-const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no; }); return {promise, resolve, reject}; };
-
-async function fixture(t, options = {}) {
-  const directory = await mkdtemp(join(tmpdir(), 'dsh-cpa-test-'));
-  await writeFile(join(directory, 'models_cache.json'), JSON.stringify({client_version: '0.165.0'}));
-  const oldHome = process.env.CODEX_HOME;
-  process.env.CODEX_HOME = directory;
-  let now = NOW, record = options.record === undefined ? grant('a') : options.record, handler, activityHandler, removed = 0, nextTimer = 1;
-  let upstream = options.fetcher ?? (async url => {
-    if (String(url).startsWith('https://chatgpt.com/backend-api/codex/models?')) return Response.json({models: [model()]});
-    assert.equal(String(url), 'https://chatgpt.com/backend-api/wham/usage');
-    return quota(12);
+const MODEL = 'gpt-5.5', A = '11111111-1111-4111-8111-111111111111', B = '22222222-2222-4222-8222-222222222222';
+const NATIVE_KEY = 'llm-pi-ai/openai-codex';
+const provider = id => 'cpa-codex-' + id;
+const deferred = () => {let resolve, reject; const promise = new Promise((yes, no) => {resolve = yes; reject = no;}); return {promise, resolve, reject};};
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const token = (id, version = 1) => 'synthetic.' + Buffer.from(JSON.stringify({sub: 'subject-' + id, email: id + '@example.test', version,
+  'https://api.openai.com/auth': {chatgpt_account_id: 'upstream-' + id, chatgpt_user_id: 'subject-' + id}})).toString('base64url') + '.signature';
+const grant = (id, version = 1) => ({kind: 'grant', payload: {type: 'oauth', access: token(id, version),
+  refresh: 'synthetic-refresh-' + id, expires: Date.now() + 3600000, accountId: 'upstream-' + id}});
+const owned = (id, principal = id) => {
+  const record = grant(principal), principalHash = createHash('sha256').update(JSON.stringify(['upstream-' + principal, 'subject-' + principal])).digest('hex');
+  record.payload.cpaBinding = {version: 1, id, principalHash}; return record;
+};
+const quota = used => Response.json({plan_type: 'plus', rate_limit: {
+  primary_window: {used_percent: used, limit_window_seconds: 18000},
+  secondary_window: {used_percent: used / 2, limit_window_seconds: 604800},
+}});
+const catalogModel = (slug = 'gpt-6-synthetic') => ({slug, display_name: slug, visibility: 'list', context_window: 100000,
+  input_modalities: ['text'], supported_reasoning_levels: [{effort: 'medium'}]});
+const SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="100" height="100"><circle cx="50" cy="50" r="30" fill="orange"/></svg>';
+function modelResponse(text = SVG, extra = {}) {
+  const item = {id: 'msg_synthetic', type: 'message', role: 'assistant', status: 'completed', content: [{type: 'output_text', text, annotations: []}]};
+  const response = {id: 'resp_synthetic', status: 'completed', model: MODEL, output: [item], service_tier: 'default',
+    usage: {input_tokens: 100, output_tokens: 20, total_tokens: 120, input_tokens_details: {cached_tokens: 20, cache_write_tokens: 0}}, ...extra};
+  const events = [{type: 'response.created', response: {id: response.id}},
+    {type: 'response.output_item.added', output_index: 0, item: {...item, content: []}},
+    {type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: text},
+    {type: 'response.output_item.done', output_index: 0, item}, {type: 'response.completed', response}];
+  return new Response(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join(''), {
+    status: 200, headers: {'content-type': 'text/event-stream'},
   });
-  const timers = new Map(), listeners = new Map(), calls = [], mutations = [], modelCalls = [];
-  t.mock.method(Date, 'now', () => now);
-  t.mock.method(performance, 'now', () => now - NOW);
-  t.mock.method(globalThis, 'setTimeout', (fn, delay) => { const id = nextTimer++; timers.set(id, {fn, delay}); return id; });
-  t.mock.method(globalThis, 'setInterval', (fn, delay) => { const id = nextTimer++; timers.set(id, {fn, delay, interval: true}); return id; });
-  t.mock.method(globalThis, 'clearTimeout', id => timers.delete(id));
-  t.mock.method(globalThis, 'clearInterval', id => timers.delete(id));
-  t.mock.method(globalThis, 'fetch', async (url, init) => { calls.push({url: String(url), init}); return upstream(url, init); });
-  const settings = options.settings ?? {providers: {}, defaultProvider: 'retained-provider', defaultModel: 'retained-model'};
-  let revision = 7;
-  const ctx = {
-    authorization: options.authorization ?? {begin: async () => { throw Error('unexpected-login'); }},
-    credentials: {readRecord: async key => { assert.equal(key, 'llm-pi-ai/openai-codex'); return record; }},
-    llm: {
-      listModels: options.listModels ?? (async () => [{id: 'gpt-configured'}]),
-      stream: options.stream === null ? undefined : request => {
-        modelCalls.push(request);
-        const next = () => {
-          assert.equal(typeof options.stream, 'function', 'model calls must be explicitly mocked');
-          return options.stream(request);
-        };
-        const observe = listeners.get('llm/stream');
-        return observe ? observe(request, next) : next();
-      }
-    },
-    on: (event, listener) => { listeners.set(event, listener); return () => listeners.delete(event); },
-    settings: {
-      describe: () => [{ns: 'llm-pi-ai', value: settings, revision}],
-      mutate: async (ns, ops, expected) => {
-        assert.equal(expected, revision);
-        mutations.push({ns, ops, expected});
-        for (const op of ops) {
-          let target = settings;
-          for (const key of op.path.slice(0, -1)) target = target[key] ??= {};
-          target[op.path.at(-1)] = structuredClone(op.value);
-        }
-        revision++;
-      }
-    },
-    webServer: {protocol: 'http:', getOrigin: () => 'http://localhost:7452'},
-    connection: {authenticatedUrl: origin => origin + '/synthetic-login', fetch: {register: route => {
-      if (route.path === '/api/cpa-settings') handler = route.fetch;
-      else { assert.equal(route.path, '/api/cpa-activity'); activityHandler = route.fetch; }
-      return () => { removed++; };
-    }}},
-    effect: () => {}
+}
+function decodeBody(init) {
+  const bytes = Buffer.from(init.body);
+  return JSON.parse((new Headers(init.headers).get('content-encoding') === 'zstd' ? zlib.zstdDecompressSync(bytes) : bytes).toString('utf8'));
+}
+function png() {
+  const table = Uint32Array.from({length: 256}, (_, i) => {let c = i; for (let b = 0; b < 8; b++) c = c & 1 ? 0xedb88320 ^ c >>> 1 : c >>> 1; return c >>> 0;});
+  const chunk = (type, bytes) => {
+    const result = Buffer.alloc(bytes.length + 12); result.writeUInt32BE(bytes.length); result.write(type, 4); bytes.copy(result, 8);
+    let crc = 0xffffffff; for (const v of result.subarray(4, -4)) crc = table[(crc ^ v) & 255] ^ crc >>> 8;
+    result.writeUInt32BE((crc ^ 0xffffffff) >>> 0, result.length - 4); return result;
   };
-  const dispose = apply(ctx);
-  t.after(async () => {
-    dispose();
-    if (oldHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldHome;
-    await rm(directory, {recursive: true, force: true});
+  const head = Buffer.alloc(13); head.writeUInt32BE(1024, 0); head.writeUInt32BE(1024, 4); head[8] = 8; head[9] = 6;
+  return new Uint8Array(Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR', head),
+    chunk('IDAT', zlib.deflateSync(Buffer.alloc((1024 * 4 + 1) * 1024))), chunk('IEND', Buffer.alloc(0))]));
+}
+async function fixture(t, options = {}) {
+  const directory = await mkdtemp(join(tmpdir(), 'cpa-index-v026-'));
+  const ctx = new Context(), llm = new LlmRuntime(ctx), routes = new Map(), calls = [], modelCalls = [], settingsWrites = [], locks = new Map();
+  const records = options.records ?? new Map([[NATIVE_KEY, grant('native-a')]]);
+  let clock = Date.now(), removed = 0, raw = structuredClone(options.preferences ?? {}), revision = 0;
+  let fetcher = options.fetcher ?? (async (url, init) => String(url).includes('/codex/models?')
+    ? Response.json({models: [catalogModel()]}) : quota(init.headers['ChatGPT-Account-Id']?.endsWith('native-b') ? 84 : 12));
+  const config = Config(raw), flows = new Map();
+  const credentials = {
+    async listRecords() {return [...records].map(([key, value]) => ({key, kind: value.kind}));},
+    async readRecord(key) {return records.has(key) ? structuredClone(records.get(key)) : undefined;},
+    modifyRecord(key, transform) {
+      const previous = locks.get(key) ?? Promise.resolve();
+      const task = previous.catch(() => {}).then(async () => {
+        const current = records.has(key) ? structuredClone(records.get(key)) : undefined;
+        const next = await transform(current);
+        if (next !== undefined) {records.set(key, structuredClone(next)); ctx.emit('credentials/record-updated', key);}
+        return records.has(key) ? structuredClone(records.get(key)) : undefined;
+      });
+      locks.set(key, task.catch(() => {})); return task;
+    },
+    deleteRecord(key) {return this.modifyRecord(key, () => {records.delete(key); ctx.emit('credentials/record-updated', key);});},
+  };
+  ctx.provide('credentials', credentials);
+  ctx.provide('authorization', {
+    registerFlow(flow) {assert.match(flow.key, /^cpa-codex\//); flows.set(flow.key, flow); return () => flows.delete(flow.key);},
+    async begin(request) {const flow = flows.get(request.key); assert.ok(flow, 'the independent account flow must own its exact key');
+      await flow.run({key: request.key, method: request.method, signal: request.signal,
+        notify: request.interaction.notify, prompt: request.interaction.prompt});
+      return {status: 'authorized'};},
   });
-  const request = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => handler(new Request('http://dsh.internal/api/cpa-settings', {
-    method, headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
-    ...(body === undefined ? {} : {body: JSON.stringify(body)})
-  }));
-  const activity = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => activityHandler(new Request('http://dsh.internal/api/cpa-activity', {
-    method, headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
-    ...(body === undefined ? {} : {body: JSON.stringify(body)})
-  }));
-  return {ctx, calls, timers, mutations, modelCalls, listeners, settings, dispose, request, activity, raw: req => handler(req), activityRaw: req => activityHandler(req),
-    setRecord: value => { record = value; }, setFetcher: value => { upstream = value; }, advance: ms => { now += ms; },
-    get removed() { return removed; },
-    get: async () => { const response = await request(); assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store'); return response.json(); },
-    post: async (action, body = {}) => { const response = await request({action, ...body}); assert.equal(response.headers.get('cache-control'), 'no-store'); return response.json(); },
-    scheduled: () => [...timers.values()].find(x => x.delay === 3000).fn()
+  ctx.provide('profileContext', {dir: directory});
+  ctx.provide('webServer', {protocol: 'http:'});
+  ctx.provide('connection', {fetch: {register(route) {
+    assert.equal(route.requestBody, 'buffered'); assert.equal(Object.hasOwn(route, 'public'), false);
+    routes.set(route.path, route); return () => {removed++;};
+  }}});
+  ctx.provide('settings', {
+    describe() {return [{ns: 'cpa-settings', value: structuredClone(raw), revision}];},
+    configure() {return () => {};},
+    async mutate(ns, ops, expected) {
+      assert.equal(ns, 'cpa-settings'); assert.equal(expected, revision);
+      await options.beforeSettingsWrite?.(ops);
+      for (const op of ops) {
+        let target = raw;
+        for (const key of op.path.slice(0, -1)) target = target[key] ??= {};
+        if (op.op === 'unset') delete target[op.path.at(-1)];
+        else target[op.path.at(-1)] = structuredClone(op.value);
+      }
+      Object.assign(config, Config(raw));
+      await writeFile(join(directory, 'preferences.json'), JSON.stringify(raw));
+      settingsWrites.push(structuredClone(ops)); revision++;
+      ctx.emit('settings/document-updated', 'cpa-settings', revision);
+    },
+  });
+  class Host extends LlmAdapter {async *stream() {yield {type: 'finish', reason: {kind: 'stop'}};}}
+  const host = new Host(), offHost = llm.registerAdapter(['openai-codex'], host);
+  const renderCalls = [], renderer = options.renderer ?? {
+    render(svg, {signal}) {renderCalls.push({svg, signal}); return Promise.resolve(png());}, dispose() {},
+  };
+  let accountManager;
+  if (options.decorateAccounts) {accountManager = createAccounts(ctx, options.accountOptions); options.decorateAccounts(accountManager);}
+  const app = createCpaApp(ctx, config, {schedule: false, now: () => clock, renderer,
+    ...(accountManager ? {accounts: accountManager} : {}),
+    accountOptions: options.accountOptions,
+    fetchImpl: async (url, init) => {calls.push({url: String(url), init}); return fetcher(url, init);},
+    catalogOptions: {readClientMetadata: async () => JSON.stringify({client_version: '0.165.0'})},
+    transportOptions: {fetchImpl: async (url, init) => {const call = {url: String(url), init, body: decodeBody(init)}; modelCalls.push(call);
+      return options.modelFetch ? options.modelFetch(call) : modelResponse();}},
+    ...(options.appOptions ?? {}),
+  });
+  t.after(async () => {await app.dispose(); offHost(); await rm(directory, {recursive: true, force: true});});
+  await app.ready;
+  const send = (path, body, headers = {}, method = body === undefined ? 'GET' : 'POST') => {
+    const request = new Request('http://dsh.internal' + path, {method,
+      headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
+      ...(body === undefined ? {} : {body: JSON.stringify(body)}),
+    });
+    return routes.get(new URL(request.url).pathname).fetch(request);
+  };
+  const get = async () => {const response = await send('/api/cpa-settings'); assert.equal(response.status, 200, await response.clone().text()); return response.json();};
+  const activity = async query => {const response = await send('/api/cpa-activity' + (query ?? '')); assert.equal(response.status, 200, await response.clone().text()); return response.json();};
+  return {ctx, llm, app, records, directory, calls, modelCalls, renderCalls, settingsWrites, routes, flows, get, activity, send, host,
+    setFetcher: value => {fetcher = value;}, advance: ms => {clock += ms;}, get removed() {return removed;},
+    async setNative(value) {if (value) records.set(NATIVE_KEY, value); else records.delete(NATIVE_KEY); await ctx.emit('credentials/record-updated', NATIVE_KEY);},
   };
 }
-
-const settleActivity = async () => { for (let n = 0; n < 40; n++) await Promise.resolve(); };
-const activityJson = async f => {
-  const response = await f.activity();
-  assert.equal(response.status, 200);
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-  return response.json();
-};
-
-test('activity GET is memory-only and defaults to a disabled schedule', async t => {
-  const f = await fixture(t);
-  const state = await activityJson(f);
-  assert.equal(state.logs.summary.total, 0);
-  assert.equal(state.logs.limit, 200);
-  assert.deepEqual(state.logs.entries, []);
-  assert.equal(state.pelican.enabled, false);
-  assert.equal(state.pelican.running, false);
-  assert.equal(state.pelican.nextRunAt, null);
-  assert.equal(state.pelican.prompt, '生成一张鹈鹕骑自行车的SVG');
-  assert.equal(f.calls.length, 0);
-  assert.equal(f.modelCalls.length, 0);
-  assert.equal(f.mutations.length, 0);
-});
-
-test('activity mutations enforce origin and request shape before any model work', async t => {
-  const f = await fixture(t);
-  let response = await f.activity({action: 'pelican-run', model: 'gpt-configured'}, {origin: 'https://attacker.invalid'});
-  assert.equal(response.status, 403);
-  assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.equal((await response.json()).error, 'cross-origin-write-denied');
-  response = await f.activity(undefined, {}, 'DELETE');
-  assert.equal(response.status, 405);
-  for (const body of [null, [], 'pelican-run', {action: 'not-an-action'}]) {
-    response = await f.activity(body);
-    assert.equal(response.status, 400);
-    assert.equal((await response.json()).error, 'invalid-action');
+async function settle(f, id, count = 1) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const response = await f.send('/api/cpa-history?accountId=' + encodeURIComponent(id));
+    const history = await response.json();
+    if (history.images?.length === count) return history;
+    await tick();
   }
-  assert.equal(f.modelCalls.length, 0);
-  assert.equal(f.mutations.length, 0);
-});
-
-test('Fast cannot claim enabled or mutate unsupported host provider configuration', async t => {
-  const f = await fixture(t);
-  const state = await f.get();
-  assert.deepEqual(state.fast, {available: false, enabled: false, reason: 'host-fast-unsupported'});
-  const response = await f.request({action: 'fast', enabled: true});
-  assert.equal(response.status, 501);
-  assert.equal((await response.json()).error, 'host-fast-unsupported');
-  assert.equal(f.mutations.length, 0);
-  assert.equal(f.modelCalls.length, 0);
-});
-
-test('a manual pelican request is observed exactly once without a session or attachments', async t => {
-  const end = deferred();
-  const svg = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="1"/></svg>';
-  const f = await fixture(t, {stream: async function* () {
-    yield {type: 'text-delta', index: 0, text: svg};
-    await end.promise;
-    yield {type: 'usage', usage: {inputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 10, totalTokens: 160}};
-    yield {type: 'finish', reason: {kind: 'stop'}};
-  }});
-  const response = await f.activity({action: 'pelican-run', model: 'gpt-configured'});
-  assert.equal(response.status, 200);
-  assert.equal((await response.json()).pelican.running, true);
-  await settleActivity();
-  assert.equal(f.modelCalls.length, 1);
-  const request = f.modelCalls[0];
-  assert.equal(request.provider, 'openai-codex');
-  assert.equal(request.model, 'gpt-configured');
-  assert.equal(request.sessionId, undefined);
-  assert.deepEqual(request.tools, []);
-  assert.equal(request.messages.length, 1);
-  assert.deepEqual(request.messages[0].content, [{type: 'text', text: '生成一张鹈鹕骑自行车的SVG'}]);
-  assert.equal(request.messages[0].source.kind, 'user');
-  f.advance(100);
-  end.resolve();
-  await settleActivity();
-  const state = await activityJson(f);
-  assert.equal(state.pelican.running, false);
-  assert.equal(state.pelican.lastResult.status, 'success');
-  assert.equal(state.pelican.lastResult.svg, svg);
-  assert.equal(state.logs.summary.total, 1);
-  assert.equal(state.logs.entries.length, 1);
-  const entry = state.logs.entries[0];
-  assert.equal(entry.source, 'pelican');
-  assert.equal(entry.status, 'success');
-  assert.equal(entry.httpStatus, null);
-  assert.equal(entry.inputTokens, 150);
-  assert.equal(entry.outputTokens, 10);
-  assert.equal(entry.cacheHitRate, 1 / 3);
-  assert.equal(f.calls.length, 0);
-  assert.equal(f.mutations.length, 0);
-});
-
-test('pelican schedule configuration is explicit, delayed, and unconditionally stoppable', async t => {
-  const f = await fixture(t);
-  let response = await f.activity({action: 'pelican-configure', enabled: true, model: 'gpt-configured', intervalMinutes: 1});
-  assert.equal(response.status, 200);
-  let state = await response.json();
-  assert.equal(state.pelican.enabled, true);
-  assert.equal(state.pelican.nextRunAt, new Date(NOW + 60000).toISOString());
-  assert.equal(f.modelCalls.length, 0);
-  response = await f.activity({action: 'pelican-configure', enabled: false, model: '', intervalMinutes: -1});
-  assert.equal(response.status, 200);
-  state = await response.json();
-  assert.equal(state.pelican.enabled, false);
-  assert.equal(state.pelican.nextRunAt, null);
-  assert.equal([...f.timers.values()].some(timer => timer.delay === 60000), false);
-  assert.equal(f.mutations.length, 0);
-});
-
-test('pelican busy, cancellation, and log clearing remain isolated from generation', async t => {
-  const gate = deferred();
-  const f = await fixture(t, {stream: async function* () {
-    await gate.promise;
-    yield {type: 'text-delta', index: 0, text: '<svg></svg>'};
-    yield {type: 'finish', reason: {kind: 'stop'}};
-  }});
-  assert.equal((await f.activity({action: 'pelican-run', model: 'gpt-configured'})).status, 200);
-  await settleActivity();
-  const busy = await f.activity({action: 'pelican-run', model: 'gpt-configured'});
-  assert.equal(busy.status, 409);
-  assert.equal((await busy.json()).error, 'pelican-busy');
-  assert.equal((await f.activity({action: 'logs-clear'})).status, 200);
-  assert.equal((await activityJson(f)).logs.summary.total, 0);
-  assert.equal((await f.activity({action: 'pelican-cancel'})).status, 200);
-  await settleActivity();
-  let state = await activityJson(f);
-  assert.equal(state.pelican.running, false);
-  assert.equal(state.pelican.lastResult.status, 'cancelled');
-  assert.equal(f.modelCalls[0].signal.aborted, true);
-  gate.resolve();
-  await settleActivity();
-  state = await activityJson(f);
-  assert.equal(state.logs.summary.total, 0);
-  assert.equal(state.pelican.lastResult.svg, null);
-});
-
-test('activity disposal aborts pending model validation and rejects later writes', async t => {
-  const catalog = deferred();
-  const f = await fixture(t, {listModels: () => catalog.promise});
-  const pending = f.activity({action: 'pelican-run', model: 'gpt-configured'});
-  await settleActivity();
-  f.dispose();
-  catalog.resolve([{id: 'gpt-configured'}]);
-  assert.equal((await pending).status, 503);
-  assert.equal((await f.activity()).status, 503);
-  assert.equal((await f.activity({action: 'pelican-configure', enabled: true, model: 'gpt-configured', intervalMinutes: 1})).status, 503);
-  assert.equal(f.modelCalls.length, 0);
-  assert.equal(f.timers.size, 0);
-  assert.equal(f.listeners.size, 0);
-  assert.equal(f.removed, 2);
-});
-
-test('activity errors do not expose arbitrary catalog or provider error text', async t => {
-  const f = await fixture(t, {listModels: async () => { throw Error('synthetic-private-access-token'); }});
-  const response = await f.activity({action: 'pelican-run', model: 'gpt-configured'});
-  assert.equal(response.status, 400);
-  const text = await response.text();
-  assert.equal(text.includes('synthetic-private-access-token'), false);
-  assert.equal(JSON.parse(text).error, 'pelican-models-unavailable');
-});
-
-test('activity disposal during body parsing rejects control work before it starts', async t => {
-  const f = await fixture(t), body = deferred();
-  const req = new Request('http://dsh.internal/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
-  req.json = () => body.promise;
-  const pending = f.activityRaw(req);
-  f.dispose();
-  body.resolve({action: 'pelican-run', model: 'gpt-configured'});
-  assert.equal((await pending).status, 503);
-  assert.equal(f.modelCalls.length, 0);
-  assert.equal(f.timers.size, 0);
-});
-
-test('cancel and disable supersede older control bodies that finish parsing late', async t => {
-  for (const [action, stop] of [['pelican-run', 'pelican-cancel'], ['pelican-configure', 'pelican-configure']]) {
-    await t.test(action, async t => {
-      const f = await fixture(t), body = deferred();
-      const req = new Request('http://dsh.internal/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
-      req.json = () => body.promise;
-      const pending = f.activityRaw(req);
-      const stopped = await f.activity({action: stop, enabled: false});
-      assert.equal(stopped.status, 200);
-      body.resolve({action, enabled: true, intervalMinutes: 1, model: 'gpt-configured'});
-      const late = await pending;
-      assert.equal(late.status, 400);
-      assert.equal((await late.json()).error, 'pelican-cancelled');
-      const state = await activityJson(f);
-      assert.equal(state.pelican.enabled, false);
-      assert.equal(state.pelican.running, false);
-      assert.equal(state.pelican.nextRunAt, null);
-      assert.equal(f.modelCalls.length, 0);
-    });
-  }
-});
-
-test('disable cancels a pending configure lookup and late catalogs cannot enable a plan', async t => {
-  const catalog = deferred();
-  const f = await fixture(t, {listModels: () => catalog.promise});
-  const pending = f.activity({action: 'pelican-configure', enabled: true, model: 'gpt-configured', intervalMinutes: 1});
-  await settleActivity();
-  assert.equal((await f.activity({action: 'pelican-configure', enabled: false})).status, 200);
-  const rejected = await pending;
-  assert.equal(rejected.status, 400);
-  assert.equal((await rejected.json()).error, 'pelican-cancelled');
-  catalog.resolve([{id: 'gpt-configured'}]);
-  await settleActivity();
-  const state = await activityJson(f);
-  assert.equal(state.pelican.enabled, false);
-  assert.equal(state.pelican.nextRunAt, null);
-  assert.equal(f.modelCalls.length, 0);
-  assert.equal([...f.timers.values()].some(timer => timer.delay === 60000), false);
-});
-
-test('activity disposal aborts an active probe and discards late provider output', async t => {
-  const gate = deferred();
-  const f = await fixture(t, {stream: async function* () {
-    await gate.promise;
-    yield {type: 'text-delta', index: 0, text: '<svg>late</svg>'};
-    yield {type: 'finish', reason: {kind: 'stop'}};
-  }});
-  assert.equal((await f.activity({action: 'pelican-run', model: 'gpt-configured'})).status, 200);
-  await settleActivity();
-  f.dispose();
-  assert.equal(f.modelCalls[0].signal.aborted, true);
-  gate.resolve();
-  await settleActivity();
-  assert.equal((await f.activity()).status, 503);
-  assert.equal(f.modelCalls.length, 1);
-  assert.equal(f.timers.size, 0);
-  assert.equal(f.listeners.size, 0);
-  assert.equal(f.mutations.length, 0);
-});
+  assert.fail('expected the synthetic probe to produce its PNG history');
+}
+function delayedBody(f, path, body) {
+  let controller;
+  const stream = new ReadableStream({start(value) {controller = value;}});
+  const request = new Request('http://dsh.internal' + path, {method: 'POST', duplex: 'half', body: stream,
+    headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}});
+  return {response: f.routes.get(path).fetch(request), finish() {try {controller.enqueue(new TextEncoder().encode(JSON.stringify(body))); controller.close();} catch { /* body may have been cancelled by disposal */ }}};
+}
 
 test('same-origin writes compare scheme, host and port and reject malformed origins', () => {
   const check = (url, host, origin, extra = {}) => sameOrigin(new Request(url, {headers: {host, 'content-type': 'application/json; charset=utf-8', ...(origin === undefined ? {} : {origin}), ...extra}}));
@@ -407,326 +243,485 @@ test('missing-Origin bridge requests require real loopback Host plus JSON and no
   }
 });
 
-test('both POST routes accept the HTTPS bridge and reject scheme port and forwarded spoofing', async t => {
-  const f = await fixture(t);
-  f.ctx.webServer.protocol = 'https:';
-  for (const [send, action] of [[f.request, 'cancel'], [f.activity, 'logs-clear']]) {
-    assert.equal((await send({action}, {origin: 'https://localhost:7452'})).status, 200);
-    for (const headers of [
-      {origin: 'http://localhost:7452'}, {origin: 'https://localhost:7453'},
-      {host: 'localhost:7453', origin: 'https://localhost:7452'},
-      {origin: 'http://localhost:7452', 'x-forwarded-proto': 'http', 'x-forwarded-host': 'localhost:7452'},
-    ]) assert.equal((await send({action}, headers)).status, 403);
-  }
-  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0); assert.equal(f.mutations.length, 0);
+
+test('settings publishes only real isolated accounts and no credential data', async t => {
+  const f = await fixture(t, {records: new Map([[NATIVE_KEY, grant('native-a')], ['cpa-codex/' + B, owned(B)]])});
+  const state = await f.get();
+  assert.equal(state.accounts.length, 2);
+  assert.deepEqual(new Set(state.accounts.map(a => a.email)), new Set(['native-a@example.test', B + '@example.test']));
+  assert.ok(state.accounts.every(a => a.availability === 'ready' && a.models.includes(MODEL)));
+  assert.equal(state.accounts.filter(a => a.enabled).length, 1);
+  assert.equal(state.accounts.filter(a => a.canRunProbe).length, 1);
+  assert.equal(state.accounts.find(a => a.enabled).owned, false);
+  assert.deepEqual(state.fast.providers, [state.accounts.find(a => a.enabled).provider]);
+  assert.equal(state.fast.available, true); assert.equal(state.fast.enabled, false);
+  assert.equal(state.preferences.fastEnabled, false);
+  assert.equal(state.accounts[0].quota.windows.length, 2);
+  assert.equal(f.modelCalls.length, 0);
+  for (const secret of ['synthetic-refresh', '.signature', 'principalHash', 'cpaBinding', NATIVE_KEY]) assert.equal(JSON.stringify(state).includes(secret), false, secret);
 });
 
-test('both POST routes fail closed when a bridge has no trustworthy service protocol', async t => {
+test('activity reads persistent metadata but never initiates a model or enables a schedule', async t => {
+  const f = await fixture(t);
+  const data = await f.activity();
+  assert.equal(data.logs.storage.available, true); assert.equal(data.logs.persistent, true);
+  assert.deepEqual(data.logs.entries, []); assert.equal(data.logs.page.nextCursor, null);
+  assert.equal(data.accounts[0].pelican.intervalMinutes, 0); assert.equal(data.accounts[0].pelican.running, false);
+  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0); assert.equal(f.settingsWrites.length, 0);
+});
+
+test('Fast is an acknowledged durable preference and changes the actual owned request body', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  const before = await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL});
+  assert.equal(before.status, 200); await settle(f, id);
+  assert.equal(Object.hasOwn(f.modelCalls[0].body, 'service_tier'), false);
+  const ack = await f.send('/api/cpa-settings', {action: 'fast', enabled: true});
+  assert.equal(ack.status, 200); assert.equal((await ack.json()).fast.enabled, true);
+  assert.equal(JSON.parse(await readFile(join(f.directory, 'preferences.json'), 'utf8')).fastEnabled, true);
+  await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL}); await settle(f, id, 2);
+  assert.equal(f.modelCalls[1].body.service_tier, 'priority');
+  assert.ok(f.settingsWrites.every(ops => ops.every(op => ['fastEnabled', 'plans', 'activeAccountId'].includes(op.path[0]))));
+});
+
+test('manual probes cross the real SDK once with fixed prompt and PNG-only account history', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  assert.equal((await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL})).status, 200);
+  const history = await settle(f, id), image = history.images[0];
+  assert.equal(image.width, 1024); assert.equal(image.height, 1024);
+  assert.equal(f.modelCalls.length, 1); assert.equal(f.renderCalls.length, 1);
+  assert.equal(JSON.stringify(f.modelCalls[0].body).includes('生成一张鹈鹕骑自行车的SVG'), true);
+  assert.equal(f.modelCalls[0].body.tools?.length ?? 0, 0);
+  assert.equal(f.modelCalls[0].body.store, false);
+  assert.equal(Object.hasOwn(f.modelCalls[0].body, 'conversation'), false);
+  const response = await f.send(image.url);
+  assert.equal(response.status, 200); assert.equal(response.headers.get('content-type'), 'image/png');
+  assert.equal(response.headers.get('cache-control'), 'no-store'); assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
+  assert.deepEqual(new Uint8Array(await response.arrayBuffer()), png());
+  const activity = await f.activity();
+  assert.equal(activity.logs.entries.length, 1);
+  const row = activity.logs.entries[0];
+  assert.equal(row.source, 'pelican'); assert.equal(row.accountId, id); assert.equal(row.accountEmail, 'native-a@example.test');
+  assert.equal(row.httpStatus, 200); assert.equal(row.usageEvidence, 'provider'); assert.equal(row.finishReason, 'stop');
+  assert.equal(row.inputTokens, 100); assert.equal(row.outputTokens, 20); assert.equal(row.cacheReadTokens, 20); assert.equal(row.cacheWriteTokens, 0);
+  assert.equal(Object.hasOwn(row, 'endedAt'), false);
+  const text = await readFile(join(f.directory, '.dsh-cpa', 'activity.ndjson'), 'utf8');
+  for (const value of ['<svg', '生成一张', 'synthetic-refresh', '.signature', 'endedAt']) assert.equal(text.includes(value), false, value);
+  assert.equal(text.trim().split('\n').length, 1);
+  assert.deepEqual((await readdir(join(f.directory, '.dsh-cpa'))).sort(), ['activity.ndjson']);
+});
+
+test('per-account image endpoints reject a different account and unknown identities', async t => {
+  const f = await fixture(t, {records: new Map([[NATIVE_KEY, grant('native-a')], ['cpa-codex/' + B, owned(B)]])});
+  const accounts = (await f.get()).accounts, id = accounts.find(a => !a.owned).id;
+  await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL});
+  const image = (await settle(f, id)).images[0];
+  assert.equal((await f.send('/api/cpa-image?accountId=' + B + '&imageId=' + image.id)).status, 404);
+  assert.equal((await f.send('/api/cpa-image?accountId=missing&imageId=' + image.id)).status, 404);
+  assert.equal((await f.send('/api/cpa-image?accountId=' + id + '&imageId=../secret')).status, 404);
+  assert.equal((await f.send('/api/cpa-history?accountId=missing')).status, 404);
+});
+
+test('deleting an owned account clears its plans, selection, route and PNG history only', async t => {
+  const f = await fixture(t, {records: new Map([[NATIVE_KEY, grant('native-a')], ['cpa-codex/' + B, owned(B)]]),
+    preferences: {activeAccountId: B, plans: {[B]: {intervalMinutes: 0, model: MODEL}}}});
+  await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: B, model: MODEL});
+  const image = (await settle(f, B)).images[0];
+  const response = await f.send('/api/cpa-settings', {action: 'account-remove', accountId: B});
+  assert.equal(response.status, 200); const state = await response.json();
+  assert.equal(state.accounts.length, 1); assert.equal(state.accounts[0].owned, false);
+  assert.equal(state.preferences.activeAccountId, ''); assert.equal(Object.hasOwn(state.preferences.plans, B), false);
+  assert.equal(f.records.has('cpa-codex/' + B), false); assert.equal(f.records.has(NATIVE_KEY), true);
+  assert.equal((await f.send(image.url)).status, 404);
+});
+
+test('the host-owned native grant cannot be deleted through CPA', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  const response = await f.send('/api/cpa-settings', {action: 'account-remove', accountId: id});
+  assert.equal(response.status, 400); assert.deepEqual(await response.json(), {error: 'account-delete-forbidden'});
+  assert.equal(f.records.has(NATIVE_KEY), true);
+});
+
+test('configuring an interval persists it but waits the full period without a charged call', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id, before = Date.now();
+  const response = await f.send('/api/cpa-activity', {action: 'pelican-configure', accountId: id, intervalMinutes: 5, model: MODEL});
+  assert.equal(response.status, 200); const activity = await response.json();
+  const state = activity.accounts.find(a => a.id === id).pelican;
+  assert.equal(state.intervalMinutes, 5); assert.equal(state.running, false);
+  assert.ok(Date.parse(state.nextRunAt) >= before + 5 * 60000);
+  assert.equal(f.modelCalls.length, 0);
+  assert.equal((await f.get()).preferences.plans[id].intervalMinutes, 5);
+  const off = await f.send('/api/cpa-activity', {action: 'pelican-configure', accountId: id, intervalMinutes: 0});
+  assert.equal(off.status, 200); assert.equal((await off.json()).accounts.find(a => a.id === id).pelican.nextRunAt, null);
+});
+
+test('off and stop supersede control bodies that entered before them', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  for (const action of ['pelican-cancel', 'pelican-configure']) {
+    const delayed = delayedBody(f, '/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL});
+    assert.equal((await f.send('/api/cpa-activity', {action, accountId: id, intervalMinutes: 0})).status, 200);
+    delayed.finish();
+    const response = await delayed.response;
+    assert.equal(response.status, 409); assert.deepEqual(await response.json(), {error: 'pelican-cancelled'});
+  }
+  assert.equal(f.modelCalls.length, 0);
+});
+
+test('stopping account B does not supersede an earlier account A request', async t => {
+  const f = await fixture(t, {records: new Map([[NATIVE_KEY, grant('native-a')], ['cpa-codex/' + B, owned(B)]])});
+  const id = (await f.get()).accounts.find(a => !a.owned).id;
+  const delayed = delayedBody(f, '/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL});
+  assert.equal((await f.send('/api/cpa-activity', {action: 'pelican-cancel', accountId: B})).status, 200);
+  delayed.finish(); assert.equal((await delayed.response).status, 200); await settle(f, id);
+  assert.equal(f.modelCalls.length, 1);
+});
+
+test('body parsing after disposal cannot start control work', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  const delayed = delayedBody(f, '/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL});
+  await f.app.dispose(); delayed.finish();
+  assert.equal((await delayed.response).status, 503); assert.equal(f.modelCalls.length, 0);
+});
+
+test('unsupported schedule values and invalid account/model values never make a model request', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  for (const intervalMinutes of [-1, 1, 60, '5', null]) {
+    const response = await f.send('/api/cpa-activity', {action: 'pelican-configure', accountId: id, intervalMinutes, model: MODEL});
+    assert.equal(response.status, 400);
+  }
+  for (const accountId of ['', '../secret', 'email@example.test', '__proto__']) assert.equal((await f.send('/api/cpa-activity', {action: 'pelican-run', accountId, model: MODEL})).status, 400);
+  assert.equal((await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: 'does-not-exist'})).status, 400);
+  assert.equal(f.modelCalls.length, 0);
+});
+
+test('quota cache is isolated by principal and retains only an explicitly stale same-account observation', async t => {
+  const f = await fixture(t);
+  const original = await f.get(); await f.get(); assert.equal(f.calls.length, 1);
+  f.advance(61000); f.setFetcher(async () => new Response(null, {status: 503}));
+  const stale = await f.get(); assert.deepEqual(stale.accounts[0].quota, original.accounts[0].quota);
+  assert.equal(stale.accounts[0].quotaStale, true); assert.equal(stale.accounts[0].quotaError, 'upstream-http-503');
+  await f.setNative(grant('native-b'));
+  const replaced = await f.get(); assert.notEqual(replaced.accounts[0].id, original.accounts[0].id);
+  assert.equal(replaced.accounts[0].quota, null); assert.equal(replaced.accounts[0].quotaError, 'upstream-http-503');
+});
+
+test('credential removal clears the account row; same-principal token rotation keeps identity safely', async t => {
+  const f = await fixture(t), first = await f.get();
+  await f.setNative(grant('native-a', 2)); const rotated = await f.get();
+  assert.equal(rotated.accounts[0].id, first.accounts[0].id); assert.equal(rotated.accounts[0].email, first.accounts[0].email);
+  await f.setNative(null); const removed = await f.get();
+  assert.equal(removed.online, false); assert.deepEqual(removed.accounts, []); assert.equal(removed.fast.available, false);
+});
+
+test('concurrent state reads share one real quota fetch', async t => {
+  const gate = deferred(), entered = deferred();
+  const f = await fixture(t, {fetcher: async () => {entered.resolve(); await gate.promise; return quota(30);}});
+  const first = f.get(); await entered.promise;
+  const second = f.get(); gate.resolve();
+  const results = await Promise.all([first, second]);
+  assert.equal(f.calls.length, 1); assert.deepEqual(results[0].accounts, results[1].accounts);
+});
+
+test('late old-account quota is discarded even if its fetch ignores abort', async t => {
+  const gate = deferred(), entered = deferred();
+  const f = await fixture(t, {fetcher: async (_url, init) => {
+    if (init.headers['ChatGPT-Account-Id'] === 'upstream-native-a') {entered.resolve(); await gate.promise; return quota(1);}
+    return quota(90);
+  }});
+  const older = f.get(); await entered.promise; await f.setNative(grant('native-b'));
+  const current = await f.get(); gate.resolve();
+  assert.equal(current.accounts[0].quota.windows[0].used, 90);
+  const previous = await older; assert.equal(previous.accounts[0].quota.windows[0].used, 90);
+});
+
+test('catalog sync adds reliable account models without mutating native host settings or defaults', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  const result = await f.send('/api/cpa-settings', {action: 'sync', accountId: id});
+  assert.equal(result.status, 200); const data = await result.json(); assert.equal(data.status, 'ok');
+  assert.ok(data.added.includes('gpt-6-synthetic'));
+  const state = await f.get(); assert.ok(state.accounts[0].models.includes('gpt-6-synthetic')); assert.ok(state.accounts[0].models.includes(MODEL));
+  assert.equal(f.settingsWrites.length, 0); assert.equal(f.modelCalls.length, 0);
+});
+
+test('invalid and empty catalogs leave the owned route untouched', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  f.setFetcher(async () => Response.json({models: []}));
+  assert.equal((await (await f.send('/api/cpa-settings', {action: 'sync', accountId: id})).json()).error, 'empty-catalog');
+  f.setFetcher(async () => Response.json({unexpected: true}));
+  assert.equal((await (await f.send('/api/cpa-settings', {action: 'sync', accountId: id})).json()).error, 'invalid-catalog');
+  assert.ok((await f.get()).models.includes(MODEL)); assert.equal(f.modelCalls.length, 0);
+});
+
+test('late catalogs cannot update a replaced account and concurrent sync is deduplicated', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id, gate = deferred(), entered = deferred();
+  f.setFetcher(async () => {entered.resolve(); await gate.promise; return Response.json({models: [catalogModel()]});});
+  const first = f.send('/api/cpa-settings', {action: 'sync', accountId: id}); await entered.promise;
+  const second = f.send('/api/cpa-settings', {action: 'sync', accountId: id});
+  await tick(); await f.setNative(grant('native-b')); gate.resolve();
+  const results = await Promise.all([first, second]);
+  assert.ok((await results[0].json()).error); assert.ok((await results[1].json()).error);
+  assert.equal(f.calls.filter(call => call.url.includes('/codex/models')).length, 1);
+});
+
+test('logs persist across plugin restart while per-account PNG history does not', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL}); await settle(f, id);
+  await f.activity(); await f.app.dispose();
+  const ctx = f.ctx, newRoutes = new Map();
+  const oldRegister = ctx.connection.fetch.register;
+  ctx.connection.fetch.register = route => {newRoutes.set(route.path, route); return () => {};};
+  const app = createCpaApp(ctx, Config({}), {schedule: false, renderer: {render() {throw Error('unexpected');}, dispose() {}}, fetchImpl: async () => quota(5)});
+  t.after(async () => {await app.dispose(); ctx.connection.fetch.register = oldRegister;});
+  await app.ready;
+  const response = await newRoutes.get('/api/cpa-activity').fetch(new Request('http://dsh.internal/api/cpa-activity'));
+  assert.equal(response.status, 200); const restored = await response.json();
+  assert.equal(restored.logs.entries.length, 1); assert.equal(restored.logs.summary.total, 1);
+  assert.equal(restored.accounts[0].pelican.historyCount, 0);
+});
+
+test('logs export streams only displayed metadata and manual clear invalidates old cursors', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id;
+  await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: id, model: MODEL}); await settle(f, id);
+  const exported = await f.send('/api/cpa-logs-export?source=pelican');
+  assert.equal(exported.status, 200); assert.match(exported.headers.get('content-type'), /ndjson/);
+  assert.match(exported.headers.get('content-disposition'), /attachment/);
+  const text = await exported.text(); assert.equal(text.trim().split('\n').length, 1);
+  for (const bad of ['endedAt', '<svg', '生成一张', 'synthetic-refresh', '.signature']) assert.equal(text.includes(bad), false, bad);
+  const cleared = await f.send('/api/cpa-activity', {action: 'logs-clear'});
+  assert.equal(cleared.status, 200); assert.deepEqual((await cleared.json()).logs.entries, []);
+  assert.equal((await f.activity()).logs.summary.total, 0);
+  assert.equal((await f.send('/api/cpa-logs-export')).status, 200);
+});
+
+test('invalid log filters/cursors and arbitrary errors return only fixed safe codes', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.send('/api/cpa-activity?cursor=not-a-valid-cursor')).status, 409);
+  assert.deepEqual(await (await f.send('/api/cpa-activity?status=private')).json(), {error: 'log-store-invalid-filter'});
+  f.ctx.credentials.readRecord = async () => {throw Error('synthetic-private-access-token');};
+  const response = await f.send('/api/cpa-settings');
+  assert.notEqual(response.status, 200); assert.equal((await response.text()).includes('synthetic-private'), false);
+});
+
+test('a transport import/initialization failure does not claim working Fast or remove base routes', async t => {
+  const f = await fixture(t, {appOptions: {transportFactory: () => {throw Error('private internal failure');}}});
+  const state = await f.get(); assert.equal(state.fast.available, false); assert.equal(state.fast.enabled, false);
+  assert.equal(state.transportError, 'cpa-transport-unavailable'); assert.equal(state.accounts.length, 1); assert.equal(state.accounts[0].canRunProbe, false);
+  const response = await f.send('/api/cpa-settings', {action: 'fast', enabled: true});
+  assert.equal(response.status, 503); assert.equal((await response.text()).includes('private'), false);
+});
+
+test('no configured account cannot be falsely enabled for Fast', async t => {
+  const f = await fixture(t, {records: new Map()});
+  const response = await f.send('/api/cpa-settings', {action: 'fast', enabled: true});
+  assert.equal(response.status, 400); assert.deepEqual(await response.json(), {error: 'cpa-account-unavailable'});
+  assert.equal((await f.get()).fast.enabled, false);
+});
+
+test('write routes reject origins, malformed actions, oversized JSON, and invalid UTF-8 before model work', async t => {
+  const f = await fixture(t);
+  for (const path of ['/api/cpa-settings', '/api/cpa-activity']) {
+    assert.equal((await f.send(path, {action: 'cancel'}, {origin: 'https://localhost:7452'})).status, 403);
+    for (const body of [null, [], {action: 'unknown'}]) assert.equal((await f.send(path, body)).status, 400);
+    assert.equal((await f.send(path, undefined, {}, 'DELETE')).status, 405);
+    assert.equal((await f.send(path, {action: 'unknown', extra: 'x'.repeat(17000)})).status, 400);
+    const request = new Request('http://dsh.internal' + path, {method: 'POST', body: new Uint8Array([0xff]),
+      headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}});
+    assert.equal((await f.routes.get(path).fetch(request)).status, 400);
+  }
+  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0);
+});
+
+test('both POST routes accept the real HTTPS bridge and reject forwarded origin spoofing', async t => {
+  const f = await fixture(t); f.ctx.webServer.protocol = 'https:';
+  for (const [path, action] of [['/api/cpa-settings', 'cancel'], ['/api/cpa-activity', 'logs-clear']]) {
+    assert.equal((await f.send(path, {action}, {origin: 'https://localhost:7452'})).status, 200);
+    for (const headers of [{origin: 'http://localhost:7452'}, {origin: 'https://localhost:7453'},
+      {host: 'localhost:7453', origin: 'https://localhost:7452'},
+      {origin: 'http://localhost:7452', 'x-forwarded-proto': 'http', 'x-forwarded-host': 'localhost:7452'}]) {
+      assert.equal((await f.send(path, {action}, headers)).status, 403);
+    }
+  }
+  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0);
+});
+
+test('both POST routes reject unknown bridge protocol and non-loopback missing-Origin writes', async t => {
   const f = await fixture(t);
   for (const protocol of [undefined, null, 'http', 'ftp:']) {
     f.ctx.webServer.protocol = protocol;
-    for (const [send, action] of [[f.request, 'cancel'], [f.activity, 'logs-clear']]) {
-      const response = await send({action}, {'x-forwarded-proto': 'http', 'x-forwarded-host': 'localhost:7452'});
-      assert.equal(response.status, 403); assert.equal((await response.json()).error, 'cross-origin-write-denied');
-    }
+    for (const [path, action] of [['/api/cpa-settings', 'cancel'], ['/api/cpa-activity', 'logs-clear']]) assert.equal((await f.send(path, {action})).status, 403);
   }
-  assert.equal(f.calls.length, 0); assert.equal(f.modelCalls.length, 0); assert.equal(f.mutations.length, 0);
-});
-
-test('both POST routes retain missing-Origin loopback support without treating dsh.internal as local', async t => {
-  const f = await fixture(t);
-  for (const [raw, action, path] of [[f.raw, 'cancel', 'cpa-settings'], [f.activityRaw, 'logs-clear', 'cpa-activity']]) {
-    for (const [host, status] of [['localhost:7452', 200], ['dsh.internal', 403], ['example.invalid', 403]]) {
-      const req = new Request('http://dsh.internal/api/' + path, {method: 'POST', headers: {host, 'content-type': 'application/json'}, body: JSON.stringify({action})});
-      assert.equal((await raw(req)).status, status, host);
+  f.ctx.webServer.protocol = 'http:';
+  for (const [path, action] of [['/api/cpa-settings', 'cancel'], ['/api/cpa-activity', 'logs-clear']]) {
+    for (const [host, expected] of [['localhost:7452', 200], ['dsh.internal', 403], ['example.invalid', 403]]) {
+      const req = new Request('http://dsh.internal' + path, {method: 'POST', headers: {host, 'content-type': 'application/json'}, body: JSON.stringify({action})});
+      assert.equal((await f.routes.get(path).fetch(req)).status, expected);
     }
   }
 });
 
-test('quota cache is reused only for the same credential snapshot', async t => {
-  const f = await fixture(t);
-  const first = await f.get();
-  await f.get();
-  assert.equal(f.calls.length, 1);
-  f.setRecord(grant('b'));
-  f.setFetcher(async () => quota(88));
-  const second = await f.get();
-  assert.equal(second.accounts[0].quota.windows[0].used, 88);
-  assert.equal(first.accounts[0].quota.windows[0].used, 12);
-  assert.equal(f.calls.length, 2);
-  assert.equal(JSON.stringify(second).includes('synthetic-token'), false);
-  assert.equal(JSON.stringify(second).includes('synthetic-account'), false);
+test('disposal aborts metadata IO, removes exactly the registered routes, and rejects late replies', async t => {
+  const gate = deferred(), entered = deferred();
+  const f = await fixture(t, {fetcher: async () => {entered.resolve(); await gate.promise; return quota(9);}});
+  const response = f.send('/api/cpa-settings'); await entered.promise;
+  const first = f.app.dispose(), second = f.app.dispose(); assert.equal(first, second);
+  assert.equal(f.calls[0].init.signal.aborted, true); assert.equal(f.removed, 5);
+  gate.resolve(); assert.equal((await response).status, 503);
+  await first; assert.equal((await f.send('/api/cpa-settings')).status, 503);
 });
 
-test('a failed new-account refresh cannot retain the old account quota', async t => {
-  const f = await fixture(t);
-  await f.get();
-  f.setRecord(grant('b'));
-  f.setFetcher(async () => new Response(null, {status: 503}));
-  const state = await f.get();
-  assert.deepEqual(state.accounts[0].quota, {windows: []});
-  assert.equal(state.quotaError, 'upstream-http-503');
-  f.advance(61000);
-  assert.deepEqual((await f.get()).accounts[0].quota, {windows: []});
+test('disposal prevents an in-flight account catalog from changing a route', async t => {
+  const f = await fixture(t), id = (await f.get()).accounts[0].id, gate = deferred(), entered = deferred();
+  f.setFetcher(async () => {entered.resolve(); await gate.promise; return Response.json({models: [catalogModel()]});});
+  const response = f.send('/api/cpa-settings', {action: 'sync', accountId: id}); await entered.promise;
+  const disposing = f.app.dispose(); assert.equal(f.calls.at(-1).init.signal.aborted, true); gate.resolve();
+  assert.equal((await response).status, 503); await disposing;
 });
 
-test('credential removal and token rotation invalidate the quota cache', async t => {
-  const f = await fixture(t);
-  await f.get();
-  f.setRecord(null);
-  const signedOut = await f.get();
-  assert.equal(signedOut.online, false);
-  assert.deepEqual(signedOut.accounts, []);
-  f.setRecord(grant('a'));
-  await f.get();
-  f.setRecord({...grant('a'), payload: {...grant('a').payload, access: 'synthetic-rotated'}});
-  await f.get();
-  assert.equal(f.calls.length, 3);
+test('OAuth API adds independent accounts without replacing the native grant and cancellation can restart', async t => {
+  const pending = [];
+  const f = await fixture(t, {accountOptions: {loadOAuth: async () => ({login({notify, prompt, signal}) {
+    notify({type: 'auth_url', url: 'https://auth.openai.com/oauth/authorize?state=synthetic&redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback'});
+    const result = prompt({type: 'manual_code', message: 'callback', signal}).then(() => grant('new-account').payload);
+    pending.push(result); return result;
+  }})}});
+  const original = structuredClone(f.records.get(NATIVE_KEY));
+  const start = await f.send('/api/cpa-settings', {action: 'start'}); assert.equal(start.status, 200); assert.match((await start.json()).url, /^https:\/\/auth\.openai\.com/);
+  assert.equal((await (await f.send('/api/cpa-settings', {action: 'status'})).json()).status, 'wait');
+  assert.equal((await f.send('/api/cpa-settings', {action: 'cancel'})).status, 200);
+  assert.equal((await f.send('/api/cpa-settings', {action: 'start'})).status, 200);
+  assert.equal((await f.send('/api/cpa-settings', {action: 'callback', redirectURL: 'http://localhost:1455/auth/callback?state=synthetic&code=synthetic-code'})).status, 200);
+  for (let n = 0; n < 30; n++) {if ((await (await f.send('/api/cpa-settings', {action: 'status'})).json()).status === 'ok') break; await tick();}
+  const state = await f.get(); assert.equal(state.accounts.length, 2); assert.ok(state.accounts.some(a => a.email === 'new-account@example.test'));
+  assert.deepEqual(f.records.get(NATIVE_KEY), original);
+  assert.ok([...f.records.keys()].some(key => key.startsWith('cpa-codex/'))); assert.equal(f.modelCalls.length, 0);
+  await Promise.allSettled(pending);
 });
 
-test('same-account refresh failure retains an explicitly stale observation', async t => {
-  const f = await fixture(t);
-  const initial = await f.get();
-  f.advance(60000);
-  f.setFetcher(async () => new Response(null, {status: 503}));
-  const failed = await f.get();
-  assert.deepEqual(failed.accounts[0].quota, initial.accounts[0].quota);
-  assert.equal(failed.quotaStale, true);
-  assert.equal(failed.quotaError, 'upstream-http-503');
-  f.setFetcher(async () => quota(23));
-  const recovered = await f.get();
-  assert.equal(recovered.quotaStale, false);
-  assert.equal(recovered.quotaError, undefined);
-  assert.equal(recovered.accounts[0].quota.windows[0].used, 23);
+const consume = async stream => {const result = []; for await (const chunk of stream) result.push(chunk); return result;};
+const conversation = (prepared, text = 'synthetic policy test') => prepared.stream({model: MODEL,
+  messages: [{role: 'user', content: [{type: 'text', text}]}], tools: [], ...prepared.config});
+const twoOwned = () => new Map([['cpa-codex/' + A, owned(A)], ['cpa-codex/' + B, owned(B)]]);
+
+test('only one persisted account is enabled; inactive requests and late prepared calls perform zero model IO', async t => {
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A}});
+  const old = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  await assert.rejects(f.llm.prepareCall({provider: provider(B), model: MODEL}), {code: 'CPA_ACCOUNT_INACTIVE'});
+  const switched = await f.send('/api/cpa-settings', {action: 'account-select', accountId: B});
+  assert.equal(switched.status, 200); const state = await switched.json();
+  assert.deepEqual(state.accounts.filter(row => row.enabled).map(row => row.id), [B]);
+  assert.deepEqual(state.fast.providers, [provider(B)]);
+  const denied = await consume(conversation(old));
+  assert.equal(denied.at(-1).reason.failure.code, 'CPA_ACCOUNT_INACTIVE'); assert.equal(f.modelCalls.length, 0);
+  const saved = JSON.parse(await readFile(join(f.directory, 'preferences.json'), 'utf8'));
+  assert.equal(saved.activeAccountId, B);
+  const restarted = await fixture(t, {records: twoOwned(), preferences: saved});
+  assert.deepEqual((await restarted.get()).accounts.filter(row => row.enabled).map(row => row.id), [B]);
 });
 
-test('concurrent state reads share one quota request', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return quota(30); }});
-  const first = f.get();
-  await started.promise;
-  const second = f.get();
-  gate.resolve();
-  const states = await Promise.all([first, second]);
-  assert.equal(f.calls.length, 1);
-  assert.deepEqual(states[0], states[1]);
+test('explicitly saved empty account selection never falls back to the native host account', async t => {
+  const f = await fixture(t, {preferences: {activeAccountId: ''}}), state = await f.get();
+  assert.equal(state.accounts.length, 1); assert.ok(state.accounts.every(row => !row.enabled && !row.canRunProbe));
+  assert.equal(state.fast.available, false); assert.equal(state.preferences.activeAccountId, '');
+  const response = await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: state.accounts[0].id, model: MODEL});
+  assert.equal(response.status, 409); assert.equal((await response.json()).error, 'pelican-account-inactive'); assert.equal(f.modelCalls.length, 0);
 });
 
-test('late old-account quota responses are discarded even if fetch ignores abort', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async (_url, init) => {
-    if (init.headers.Authorization.endsWith('-a')) { started.resolve(); await gate.promise; return quota(1); }
-    return quota(90);
+test('clearing visible logs cannot bypass an active ordinary conversation lock for switching or removal', async t => {
+  const entered = deferred(), gate = deferred();
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A}, modelFetch: () => {entered.resolve(); return gate.promise;}});
+  const prepared = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  const work = consume(conversation(prepared)); await entered.promise;
+  try {
+    assert.equal((await f.send('/api/cpa-activity', {action: 'logs-clear'})).status, 200);
+    assert.equal((await f.activity()).logs.summary.running, 0);
+    for (const action of ['account-select', 'account-remove']) {
+      const response = await f.send('/api/cpa-settings', {action, accountId: action === 'account-select' ? B : A});
+      assert.equal(response.status, 409); assert.equal((await response.json()).error, 'account-switch-busy');
+    }
+    assert.equal(f.records.has('cpa-codex/' + A), true);
+  } finally {gate.resolve(modelResponse()); await work;}
+  assert.equal((await f.send('/api/cpa-settings', {action: 'account-select', accountId: B})).status, 200);
+});
+
+test('active removal closes the gate before awaiting its credential deletion, including old prepared calls', async t => {
+  const entered = deferred(), gate = deferred(); let manager;
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A}, decorateAccounts: value => {manager = value;}});
+  const original = manager.remove;
+  manager.remove = async id => {entered.resolve(); await gate.promise; return original(id);};
+  const prepared = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  const removing = f.send('/api/cpa-settings', {action: 'account-remove', accountId: A}); await entered.promise;
+  try {
+    const denied = await consume(conversation(prepared));
+    assert.equal(denied.at(-1).reason.failure.code, 'CPA_ACCOUNT_INACTIVE');
+    await assert.rejects(f.llm.prepareCall({provider: provider(B), model: MODEL}), {code: 'CPA_ACCOUNT_INACTIVE'});
+    assert.equal(f.modelCalls.length, 0);
+  } finally {gate.resolve();}
+  assert.equal((await removing).status, 200);
+  const after = await f.get(); assert.equal(after.preferences.activeAccountId, ''); assert.equal(after.accounts.some(row => row.enabled), false);
+});
+
+test('state retries across an account selection epoch instead of returning two enabled rows', async t => {
+  const entered = deferred(), gate = deferred(); let hold = false, captured = false;
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A}, appOptions: {
+    transportFactory: async (ctx, options) => {
+      const real = await createCpaTransport(ctx, options);
+      return {...real, async listModels(id) {const result = await real.listModels(id); if (hold && id === B && !captured) {captured = true; entered.resolve(); await gate.promise;} return result;}};
+    },
   }});
-  const oldRequest = f.get();
-  await started.promise;
-  f.setRecord(grant('b'));
-  const newState = await f.get();
-  assert.equal(f.calls[0].init.signal.aborted, true);
-  gate.resolve();
-  const oldState = await oldRequest;
-  assert.equal(newState.accounts[0].quota.windows[0].used, 90);
-  assert.equal(oldState.accounts[0].quota.windows[0].used, 90);
+  hold = true; const reading = f.send('/api/cpa-settings'); await entered.promise;
+  assert.equal((await f.send('/api/cpa-settings', {action: 'account-select', accountId: B})).status, 200);
+  gate.resolve(); const response = await reading; assert.equal(response.status, 200); const state = await response.json();
+  assert.deepEqual(state.accounts.filter(row => row.enabled).map(row => row.id), [B]);
+  assert.equal(state.preferences.activeAccountId, B); assert.deepEqual(state.fast.providers, [provider(B)]);
 });
 
-test('model sync adds reliable models without replacing existing or default selections', async t => {
-  const existing = {id: 'gpt-existing', name: 'Existing · 直连', custom: true};
-  const f = await fixture(t, {settings: {providers: {'openai-codex': {displayName: 'ChatGPT 直连', models: [existing], custom: 'retain'}}, defaultModel: 'gpt-existing'}});
-  const result = await f.post('sync');
-  assert.equal(result.status, 'ok');
-  assert.deepEqual(result.added, ['gpt-6-synthetic']);
-  assert.equal(f.settings.defaultModel, 'gpt-existing');
-  assert.equal(f.settings.providers['openai-codex'].custom, 'retain');
-  assert.deepEqual(f.settings.providers['openai-codex'].models[0], {...existing, name: 'Existing'});
-  await f.post('sync');
-  assert.equal(f.mutations.length, 1);
+test('unavailable or replaced principal never inherits fresh quota metadata', async t => {
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A}});
+  const initial = await f.get(); assert.ok(initial.accounts.find(row => row.id === A).quota); assert.equal(initial.accounts.find(row => row.id === A).quotaStale, false);
+  const broken = owned(A); broken.payload.access = 'not-a-token'; f.records.set('cpa-codex/' + A, broken);
+  const state = await f.get(), row = state.accounts.find(row => row.id === A);
+  assert.notEqual(row.availability, 'ready'); assert.equal(row.quota, null); assert.equal(row.quotaStale, true); assert.equal(row.enabled, false);
 });
 
-test('invalid or empty catalog leaves existing settings untouched', async t => {
-  const settings = {providers: {'openai-codex': {displayName: 'ChatGPT', models: [{id: 'gpt-existing'}]}}};
-  const f = await fixture(t, {settings, fetcher: async () => Response.json({models: [null, {}]})});
-  assert.equal((await f.post('sync')).status, 'ok');
-  assert.equal(f.mutations.length, 0);
-  f.setFetcher(async () => Response.json({unexpected: true}));
-  assert.equal((await f.post('sync')).error, 'invalid-catalog');
-  assert.equal(f.mutations.length, 0);
-  assert.deepEqual(settings.providers['openai-codex'].models, [{id: 'gpt-existing'}]);
+test('switching pauses an old saved plan but preserves its PNG history and waits a full interval when re-enabled', async t => {
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A}});
+  await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: A, model: MODEL}); await settle(f, A);
+  assert.equal((await f.send('/api/cpa-activity', {action: 'pelican-configure', accountId: A, model: MODEL, intervalMinutes: 5})).status, 200);
+  await f.send('/api/cpa-settings', {action: 'account-select', accountId: B});
+  let row = (await f.activity()).accounts.find(value => value.id === A).pelican;
+  assert.equal(row.available, false); assert.equal(row.intervalMinutes, 5); assert.equal(row.nextRunAt, null); assert.equal(row.historyCount, 1);
+  assert.equal((await f.send('/api/cpa-history?accountId=' + A)).status, 200);
+  assert.equal((await f.send('/api/cpa-activity', {action: 'pelican-run', accountId: A, model: MODEL})).status, 409);
+  await f.send('/api/cpa-settings', {action: 'account-select', accountId: A});
+  row = (await f.activity()).accounts.find(value => value.id === A).pelican;
+  assert.equal(row.available, true); assert.equal(row.historyCount, 1); assert.ok(Date.parse(row.nextRunAt) >= Date.now() + 290000);
+  assert.equal(f.modelCalls.length, 1);
 });
 
-test('a late catalog from a replaced account cannot write model settings', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return Response.json({models: [model()]}); }});
-  const syncing = f.post('sync');
-  await started.promise;
-  f.setRecord(grant('b'));
-  gate.resolve();
-  assert.equal((await syncing).error, 'account-changed');
-  assert.equal(f.mutations.length, 0);
-});
 
-test('dispose aborts quota requests and removes routes and timers once', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return quota(4); }});
-  const request = f.request();
-  await started.promise;
-  f.dispose(); f.dispose();
-  assert.equal(f.calls[0].init.signal.aborted, true);
-  assert.equal(f.removed, 2);
-  assert.equal(f.timers.size, 0);
-  gate.resolve();
-  assert.equal((await request).status, 503);
-  assert.equal((await f.request()).status, 503);
-});
-
-test('dispose prevents in-flight catalog requests from mutating settings', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return Response.json({models: [model()]}); }});
-  const request = f.request({action: 'sync'});
-  await started.promise;
-  f.dispose();
-  assert.equal(f.calls[0].init.signal.aborted, true);
-  gate.resolve();
-  assert.equal((await request).status, 503);
-  assert.equal(f.mutations.length, 0);
-});
-
-test('dispose while reading credentials prevents any upstream request', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t);
-  f.ctx.credentials.readRecord = async () => { started.resolve(); await gate.promise; return grant('a'); };
-  const response = f.request();
-  await started.promise;
-  f.dispose(); gate.resolve();
-  assert.equal((await response).status, 503);
-  assert.equal(f.calls.length, 0);
-});
-
-test('scheduled sync does not POST after disposal during local authentication', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return new Response(null, {status: 302, headers: {'set-cookie': 'synthetic=1; HttpOnly'}}); }});
-  const scheduled = f.scheduled();
-  await started.promise;
-  f.dispose();
-  assert.equal(f.calls[0].init.signal.aborted, true);
-  gate.resolve(); await scheduled;
-  assert.equal(f.calls.length, 1);
-});
-
-test('scheduled work is deduplicated and its POST signal aborts on disposal', async t => {
-  const gate = deferred(), posted = deferred();
-  const f = await fixture(t, {fetcher: async (url, init) => {
-    if (String(url).endsWith('/synthetic-login')) return new Response(null, {status: 302, headers: {'set-cookie': 'synthetic=1; HttpOnly'}});
-    assert.equal(init.method, 'POST');
-    assert.equal(init.headers.cookie, 'synthetic=1');
-    assert.equal(init.headers.origin, 'http://localhost:7452');
-    posted.resolve(); await gate.promise; return Response.json({status: 'ok'});
+for (const fail of [false,true]) test('settings ACK keeps both account gates closed and restores safely on failure: '+fail, async t=>{
+  const entered=deferred(),gate=deferred();
+  const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A,plans:{[A]:{intervalMinutes:5,model:MODEL}}},beforeSettingsWrite:async ops=>{
+    if(ops.some(op=>op.path[0]==='activeAccountId'&&op.value===B)){entered.resolve();await gate.promise;if(fail)throw Error('synthetic private write failure');}
   }});
-  const first = f.scheduled(), second = f.scheduled();
-  assert.equal(first, second);
-  await posted.promise;
-  f.dispose();
-  assert.equal(f.calls[1].init.signal.aborted, true);
-  gate.resolve(); await first;
-  assert.equal(f.calls.length, 2);
+  const stale=delayedBody(f,'/api/cpa-activity',{action:'pelican-run',accountId:A,model:MODEL});
+  const selecting=f.send('/api/cpa-settings',{action:'account-select',accountId:B});await entered.promise;
+  try{for(const id of [A,B])await assert.rejects(f.llm.prepareCall({provider:provider(id),model:MODEL}),{code:'CPA_ACCOUNT_INACTIVE'});stale.finish();assert.equal((await stale.response).status,409);assert.equal(f.modelCalls.length,0);}finally{gate.resolve();}
+  assert.equal((await selecting).status,fail?503:200);assert.deepEqual((await f.get()).accounts.filter(row=>row.enabled).map(row=>row.id),[fail?A:B]);
+  if(fail){const plan=(await f.activity()).accounts.find(row=>row.id===A).pelican;assert.equal(plan.intervalMinutes,5);assert.ok(Date.parse(plan.nextRunAt)>Date.now()+290000);}
 });
 
-test('write routes reject cross-origin requests and malformed actions', async t => {
-  const f = await fixture(t);
-  assert.equal((await f.request({action: 'sync'}, {origin: 'https://localhost:7452'})).status, 403);
-  for (const body of [null, [], {action: 'unknown'}]) assert.equal((await f.request(body)).status, 400);
-  assert.equal((await f.request(undefined, {}, 'DELETE')).status, 405);
-  assert.equal(f.calls.length, 0);
-});
-
-test('OAuth can be cancelled through the API and immediately restarted', async t => {
-  let starts = 0;
-  const f = await fixture(t, {authorization: {begin: async request => {
-    starts++;
-    request.interaction.notify({url: 'https://auth.openai.com/oauth/authorize?state=synthetic'});
-    await request.interaction.prompt({kind: 'text', signal: request.signal});
-    return {status: 'authorized'};
+test('a late Fast response cannot acknowledge a different newly enabled account',async t=>{
+  const entered=deferred(),gate=deferred();let hold=false,captured=false;
+  const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A},appOptions:{transportFactory:async(ctx,options)=>{
+    const real=await createCpaTransport(ctx,options);return {...real,async listModels(id){const result=await real.listModels(id);if(hold&&id===B&&!captured){captured=true;entered.resolve();await gate.promise;}return result;}};
   }}});
-  assert.match((await f.post('start')).url, /^https:\/\/auth\.openai\.com/);
-  assert.equal((await f.post('status')).status, 'wait');
-  assert.equal((await f.post('start')).error, 'already-running');
-  assert.equal((await f.post('cancel')).status, 'cancelled');
-  assert.equal((await f.post('status')).status, 'error');
-  assert.match((await f.post('start')).url, /^https:\/\/auth\.openai\.com/);
-  assert.equal(starts, 2);
-  await f.post('cancel');
+  hold=true;const fast=f.send('/api/cpa-settings',{action:'fast',enabled:true,accountId:A});await entered.promise;
+  assert.equal((await f.send('/api/cpa-settings',{action:'account-select',accountId:B})).status,200);gate.resolve();const response=await fast;
+  assert.equal(response.status,409);assert.equal((await response.json()).error,'account-changed');
 });
 
-
-test('concurrent model syncs share one request and one revisioned mutation', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return Response.json({models: [model()]}); }});
-  const first = f.post('sync');
-  await started.promise;
-  const second = f.post('sync');
-  gate.resolve();
-  const results = await Promise.all([first, second]);
-  assert.deepEqual(results[0], results[1]);
-  assert.equal(results[0].status, 'ok');
-  assert.equal(f.calls.length, 1);
-  assert.equal(f.mutations.length, 1);
-});
-
-test('an empty first catalog does not create an empty provider', async t => {
-  const f = await fixture(t, {fetcher: async () => Response.json({models: []})});
-  assert.equal((await f.post('sync')).error, 'empty-catalog');
-  assert.deepEqual(f.settings.providers, {});
-  assert.equal(f.mutations.length, 0);
-});
-
-test('scheduled login cannot continue under a replaced account', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {fetcher: async () => { started.resolve(); await gate.promise; return new Response(null, {status: 302, headers: {'set-cookie': 'synthetic=1'}}); }});
-  const scheduled = f.scheduled();
-  await started.promise;
-  f.setRecord(grant('b'));
-  gate.resolve(); await scheduled;
-  assert.equal(f.calls.length, 1);
-});
-
-test('cancelled OAuth completion cannot report success after an in-flight sync', async t => {
-  const gate = deferred(), started = deferred();
-  const f = await fixture(t, {authorization: {begin: async request => {
-    request.interaction.notify({url: 'https://auth.openai.com/oauth/authorize?state=synthetic'});
-    return {status: 'authorized'};
-  }}, fetcher: async () => { started.resolve(); await gate.promise; return Response.json({models: [model()]}); }});
-  await f.post('start');
-  const status = f.post('status');
-  await started.promise;
-  await f.post('cancel');
-  gate.resolve();
-  assert.equal((await status).status, 'error');
-});
-
-test('disposal in the final state-await microtask cannot return a successful GET', async t => {
-  const f = await fixture(t, {record: null});
-  let reads = 0;
-  f.ctx.credentials.readRecord = async () => {
-    if (++reads === 2) queueMicrotask(() => queueMicrotask(() => queueMicrotask(() => f.dispose())));
-    return null;
-  };
-  const response = await f.request();
-  assert.equal(f.removed, 2);
-  assert.equal(response.status, 503);
-  assert.deepEqual(await response.json(), {error: 'plugin-disposed'});
-});
-
-test('quota and sync errors also redact safe-looking upstream details', async t => {
-  const f = await fixture(t, {fetcher: async () => { throw Error('synthetic-private-token'); }});
-  assert.equal((await f.get()).quotaError, 'quota-unavailable');
-  assert.equal((await f.post('sync')).error, 'sync-failed');
-});
-
-test('API errors never echo arbitrary credential service error text', async t => {
-  const f = await fixture(t);
-  for (const detail of ['private synthetic-token payload', 'synthetic-secret-token', 'private', 'upstream-http-private']) {
-    f.ctx.credentials.readRecord = async () => { throw Error(detail); };
-    const response = await f.request();
-    assert.equal(response.status, 400);
-    assert.deepEqual(await response.json(), {error: 'request-failed'});
-  }
+test('inactive identity replacement cannot relabel a former account quota as fresh',async t=>{
+  const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A}});assert.ok((await f.get()).accounts.find(row=>row.id===A).quota);
+  await f.send('/api/cpa-settings',{action:'account-select',accountId:B});f.records.set('cpa-codex/'+A,owned(A,'replacement-person'));
+  const row=(await f.get()).accounts.find(row=>row.id===A);assert.equal(row.email,'replacement-person@example.test');assert.equal(row.quota,null);assert.equal(row.quotaStale,true);assert.equal(row.enabled,false);
 });

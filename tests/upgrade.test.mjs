@@ -5,8 +5,8 @@ import {tmpdir} from 'node:os';
 import {basename, dirname, join, resolve} from 'node:path';
 import {fileURLToPath, pathToFileURL} from 'node:url';
 
-const retired = ['index-v022.mjs', 'index-v023.mjs', 'index-v024.mjs'];
-const implementation = '../lib/index-v025.mjs';
+const retired = ['index-v022.mjs', 'index-v023.mjs', 'index-v024.mjs', 'index-v025.mjs'];
+const implementation = '../lib/index-v026.mjs';
 
 test('all retired backend entries forward to the current implementation', async () => {
   const current = await import(implementation);
@@ -15,7 +15,7 @@ test('all retired backend entries forward to the current implementation', async 
     assert.deepEqual(Object.keys(legacy).sort(), Object.keys(current).sort());
     for (const key of Object.keys(current)) assert.equal(legacy[key], current[key], name + ': ' + key);
     const source = await readFile(new URL('../lib/' + name, import.meta.url), 'utf8');
-    assert.match(source, /export \* from '\.\/index-v025\.mjs'/);
+    assert.match(source, /export \* from '\.\/index-v026\.mjs'/);
   }
 });
 
@@ -30,7 +30,7 @@ test('a cached resolved entry remains loadable after package files are replaced'
     const lib = join(packageDirectory, 'lib');
     await mkdir(lib, {recursive: true});
     const manifest = version => JSON.stringify({name: 'cpa-upgrade-fixture', type: 'module', version,
-      exports: version === '0.2.5' ? './lib/index-v025.mjs' : './lib/' + name});
+      exports: version === '0.2.6' ? './lib/index-v026.mjs' : './lib/' + name});
     await writeFile(join(packageDirectory, 'package.json'), manifest('0.2.3'));
     await writeFile(join(lib, name), "export const version = 'old';\n");
     const resolverPath = join(directory, 'resolve.mjs');
@@ -40,8 +40,8 @@ test('a cached resolved entry remains loadable after package files are replaced'
     assert.equal(basename(fileURLToPath(previousAddress)), name);
 
     // This models the observed 0.2.4 failure: new manifest + removed old entry.
-    await writeFile(join(packageDirectory, 'package.json'), manifest('0.2.5'));
-    await writeFile(join(lib, 'index-v025.mjs'), "export const version = '0.2.5';\n");
+    await writeFile(join(packageDirectory, 'package.json'), manifest('0.2.6'));
+    await writeFile(join(lib, 'index-v026.mjs'), "export const version = '0.2.6';\n");
     await unlink(join(lib, name));
     await assert.rejects(readFile(new URL(previousAddress)), {code: 'ENOENT'});
     const afterUpgrade = resolver.entry();
@@ -49,19 +49,23 @@ test('a cached resolved entry remains loadable after package files are replaced'
     // Even if a future Node refreshes its cache, a host can still hold this old URL.
     const compatibilityEntry = await readFile(new URL('../lib/' + name, import.meta.url), 'utf8');
     await writeFile(join(lib, name), compatibilityEntry);
-    assert.ok((await readFile(new URL(previousAddress), 'utf8')).includes('index-v025.mjs'));
+    assert.ok((await readFile(new URL(previousAddress), 'utf8')).includes('index-v026.mjs'));
     const loaded = await import(previousAddress);
-    assert.equal(loaded.version, '0.2.5');
+    assert.equal(loaded.version, '0.2.6');
   });
 });
 
 test('package metadata exposes current entries without excluding compatibility files', async () => {
   const manifest = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
-  assert.equal(manifest.version, '0.2.5');
-  assert.equal(manifest.main, './lib/index-v025.mjs');
+  assert.equal(manifest.version, '0.2.6');
+  assert.equal(manifest.main, './lib/index-v026.mjs');
   assert.equal(manifest.exports['.'], manifest.main);
-  assert.equal(manifest.exports['./client'], './lib/client-v025.js');
+  assert.equal(manifest.exports['./client'], './lib/client-v026.js');
   assert.ok(manifest.files.includes('lib'));
   // Keep the last shipped client asset available while an existing page reloads.
   await readFile(new URL('../lib/client-v024.js', import.meta.url));
+  await readFile(new URL('../lib/client-v025.js', import.meta.url));
+  assert.equal(manifest.dependencies['@earendil-works/pi-ai'], '1.3.0');
+  assert.equal(manifest.dependencies['@resvg/resvg-wasm'], '2.6.2');
+  assert.equal(manifest.engines.dsh, '>=0.2.2-rc.1');
 });

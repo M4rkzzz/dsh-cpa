@@ -1,57 +1,55 @@
 # DSH ChatGPT Direct
 
-DSH plugin for in-process ChatGPT Codex authorization, model discovery, account quota, request telemetry and lightweight scheduled SVG checks. It uses the built-in `llm-pi-ai/openai-codex` transport and DSH credential store. No CLIProxyAPI process is needed for direct sessions.
+Isolated ChatGPT Codex accounts, quota, real Fast, persistent request metadata and memory-only pelican PNG history. No CLIProxyAPI process is required. Requires **DSH 0.2.2-rc.1+** and **Node 22.19.0+**.
 
-Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. GitHub-source Market installs can detect version bumps on the default branch; a GitHub Release is not required for that channel. In Settings → CPA, choose **Add ChatGPT account**. Model sync adds account-listed models while retaining existing models and the default selection. Choose an `openai-codex` conversation model to use direct transport. Existing `chatgpt-cpa` sessions keep their original route until switched.
+Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. The GitHub channel detects version bumps on the default branch without requiring a GitHub Release.
 
-## 0.2.5: hot-update repair
+## 0.2.6
 
-Retired backend entry paths remain as forwarding modules, so a host retaining an older package resolution can still activate the current implementation. This repairs the missing-entry activation failure during a 0.2.4 hot update. POST origin checks now account for Host Connection's internal bridge URL without weakening authentication or trusting forwarded headers. Plain-text HTTP failures retain safe status codes, and the page uses fewer repeated labels and explanations.
+- The composer toolbar contains **Fast / weekly quota**, matched to the adjacent model control's font, line-height and height.
+- Account entries use the email when available. **Save multiple accounts, but enable only one CPA account at a time.** The single green selected control means enabled with valid identity-bound credentials, not that a charged availability test has succeeded.
+- Enable an account with its radio control. If a session exists and its model is supported, select that account's **CPA Codex** provider through the normal model selector; otherwise choose a supported model explicitly. Activation also persists without an open session. The plugin never redirects an already-prepared request or replaces the original `openai-codex`/legacy proxy routes.
+- On the owned CPA channel, Fast sends `service_tier: "priority"`. Off keeps the same channel without requesting priority. Changes affect future prepared calls, not work already in progress. **Fast may consume quota faster.** Requested and provider-reported tiers remain separate.
+- Preferences persist through official Config/settings; account grants remain in the official credential service. Each added account has its own OAuth flow and key. The host's current grant is referenced without copying its rotating refresh token.
 
-After a failed 0.2.4 upgrade, verify actual activation and refresh the page after installing the repair. Replaced files or a Market “live” label alone do not prove that routes work. Do not delete credentials or unrelated plugins.
+## Per-account pelican checks
 
-## Request activity
+Click **鹈鹕测试** to run once; the running control can stop the attempt. The dropdown is limited to **Off / 5 / 10 / 20 / 30 minutes**. Selecting an interval saves the plan but **does not run immediately**. Restoring/rescheduling waits a full interval with no catch-up. Each account is single-flight; the next interval starts after completion.
 
-The CPA page observes **new `openai-codex` LLM requests after this plugin loads**, including pelican tests. Other providers, historical sessions, and account quota/catalog HTTP calls are not request-log entries. It does not replay or scan conversations.
+Switching pauses the former account while keeping its PNG history and saved plan. Re-enabling waits a full interval. Inactive accounts cannot start CPA model calls or tests; there is no round-robin switching. Stop an existing ordinary CPA conversation before switching or removing its active account.
 
-- Recent 200 requests: timestamp, source, outcome, **actual HTTP status when exposed**, model, cache-hit rate, input/output tokens, TTFT, elapsed time, observed TPS and estimated USD.
-- Summary since load or clear: request/outcome counts, token totals, mean TTFT/elapsed/TPS/cache-hit rate, and USD estimates with priced/unpriced coverage. Clearing logs resets this window; it does not cancel a request.
-- The bounded log and scalar aggregates are kept in memory, reset on plugin reload, and do not create log files. Unknown measurements are shown as `—`, never fabricated as zero or HTTP 200. Aggregates exclude unknown metric samples and display their coverage. Activity polling is visible-only every 3 seconds and does not refresh the quota endpoint.
-
-### Metric definitions
-
-`inputTokens` is the full prompt including cached reads/writes; the host's pi-ai uncached-input field is normalized rather than mistaken for the full input. Cache hit is cached-read tokens / full prompt tokens. Missing cache details are unknown unless cumulative accounting can prove a zero count. The displayed average cache hit is the arithmetic mean of known per-request rates, not a token-weighted account rate.
-
-TTFT runs from local stream iteration start to the first nonempty text, reasoning or tool-call token delta. Elapsed time ends at the terminal event or cancellation. TPS = reported output tokens / seconds between first token and completion, only when both tokens and a positive interval exist. These are **client-observed** stream metrics, not server-side decoding benchmarks. Output includes reasoning tokens when the provider reports them. Repeated usage chunks are cumulative snapshots, not additional tokens.
-
-The installed DSH pi-ai adapter does not normally expose HTTP response status, so the status-code column often remains `—` even on success. Outcome and HTTP code are separate. Only explicit structured response/failure codes may be shown; error text is never parsed to guess a code.
-
-### Estimated USD, not a subscription bill
-
-Known model prices are a bundled snapshot of [OpenAI's official Standard API price table](https://developers.openai.com/api/docs/pricing), checked **2026-11-08**, with verified model-page references included in the pricing metadata. Input, cached input and output are priced separately; supported long-context thresholds are applied to the whole request. Model names and verified snapshots are matched explicitly, not by guessing that similarly named models share a price.
-
-This is an API-price equivalent, **not a ChatGPT subscription bill or actual quota charge**. Fast/Priority, Batch/Flex, regional uplifts, special contracts, tools, images and other non-token charges are not included. Missing model prices or token data remain unpriced; the total explicitly shows its coverage. If an upper-bound estimate is available despite incomplete cache details, it is labeled `≤` and is not presented as an exact estimate. Refresh the bundled price table when official prices change; there is no background pricing download or on-disk pricing cache.
-
-## Pelican SVG check
-
-Choose an account-listed model in Settings → CPA, then use **Run once** or explicitly enable a recurring plan with an integer interval of **1–10080 minutes**. The exact prompt is:
+The exact prompt is:
 
 > 生成一张鹈鹕骑自行车的SVG
 
-Plans are **off by default** and are not persisted across reloads. Enabling a plan waits one full interval before the first request; the next interval begins after completion. Only one validation/generation runs at once. Cancel stops the current test; disabling stops both the current test and the plan. Requests consume your real model quota only after an explicit run/enable action.
+A test consumes real model quota on the explicitly chosen account/model. It creates no session, tools or attachments. Validation, generation and rendering have a 120-second overall deadline and a 256-KiB output cap. A controlled background WASM worker converts restricted SVG into PNG, then discards the SVG; only PNG buffers and small image metadata remain.
 
-The check calls the host LLM service directly with a plain text message: **no session, tools, attachments, SVG files, output files or cache files are created by the test**. Only the latest result is kept in memory. A 120-second overall deadline and 256-KiB output limit bound a run; cancellation/disposal reject late results. The SVG is displayed as escaped text, never executed or injected into the document. A test result is not a visual-quality or model-availability guarantee.
+History opens authenticated PNG images for that account. Limits are 8 images per account, 64 images / 16 MiB globally, and 2 MiB per image. Reload clears images, not preferences or logs. No image or test-transcript files are written. Scripts, entities, external/local resources, embedded images and excessive complexity are rejected; failed rasterization never creates a successful history item.
 
-This no-artifact guarantee applies to the pelican feature. It does not prevent normal DSH credential refresh persistence, independent host tracing/middleware, OS/browser behavior or upstream provider retention. The plugin does not enable tracing or modify those host policies.
+## Request logs
 
-## Fast compatibility
+Only new owned CPA Codex and original `openai-codex` model calls are observed after loading. No historical session scanning/replay; quota and catalog HTTP reads are not model-log entries.
 
-A **Fast** switch is placed immediately to the left of weekly quota. It is explicitly disabled in this release: the verified DSH `0.2.2-rc.1` public Codex adapter does not forward `service_tier`. This plugin does not pretend a UI toggle changes routing, replace the global network stack, or modify an installed DSH. Actual Fast mode needs a supported host adapter interface first.
+Terminal display metadata is appended as NDJSON under the active profile's `.dsh-cpa/activity.ndjson`, with **no automatic count/size retention limit**. Fields are start time, account email, source, model/provider, outcome/finish reason, fixed safe error, real HTTP status, cache/token metrics, TTFT/duration/TPS, Standard-price reference and tier evidence. No end timestamp, prompts, output/reasoning, tool arguments, session ids, credentials or raw errors are retained.
 
-## Quota and authorization
+The UI keeps one 50-row page, supports filters, streaming export and explicit clear; resident memory does not grow with history. Rows are typically hundreds of bytes to roughly 1 KB, but unlimited accumulation still consumes disk. Logs survive reloads. Clear does not delete accounts/images or cancel ordinary conversations.
 
-Quota is an account-level observation, refreshed while the settings page or a direct conversation is visible, not a per-model guarantee. Credentials never leave DSH's credential store except in authorized calls to ChatGPT. Write routes require the host's authenticated connection and same-origin validation; responses use `Cache-Control: no-store`.
+Only start time is shown: local-today `HH:mm`, otherwise `MM-DD`, with a full start-date tooltip. There is no end-time column.
 
-Model discovery uses a minimum tested Codex catalog compatibility version of `0.165.0`. When a local Codex model cache is available, only its newer stable `client_version` is read; no cached models, identity or credentials are imported. Machines without Codex use the bundled compatibility baseline.
+### Metrics and reference prices
 
-The interface uses layout patterns from the MIT-licensed DSH OpenCode Go plugin; see [third-party notices](<THIRD_PARTY_NOTICES.md>). See [security notes](<SECURITY.md>) and the [Chinese guide](<README.zh-CN.md>).
+Input is the complete prompt including cache. Missing provider fields remain unknown; normalized host defaults cannot prove a true zero cache count or a free request. Aggregates show known-sample coverage. TTFT is locally observed time to the first text/reasoning/tool delta; TPS is reported output tokens divided by seconds after the first token until termination, not an upstream decoding benchmark.
+
+The owned channel deliberately uses SSE for real HTTP response status and raw usage evidence. Original host requests keep unknown values where the host does not expose them; success never implies HTTP 200.
+
+USD uses the bundled [official OpenAI Standard API price table](https://developers.openai.com/api/docs/pricing), checked **2026-11-08**. It is **not a ChatGPT subscription bill or actual quota charge**, and excludes Fast/Priority uplifts and non-token charges. Requested priority does not prove served priority. Unknown models/incomplete usage are not valued at zero; reliable upper bounds are labeled `≤`.
+
+## Updates and security
+
+Every retired backend entry directly forwards to the current implementation to tolerate cached package resolution; old client assets remain available for pages awaiting refresh. After upgrading, verify actual authenticated routes and refresh the page rather than relying on a Market activation label. Do not delete credentials or unrelated plugins to repair an update.
+
+Routes retain host authentication and strict Host Connection origin checks without trusting forwarded headers. JSON and PNG responses are not cached. The browser never receives grants or executable SVG.
+
+Model sync adds reliable account catalog entries without overwriting host defaults or other routes. Its compatibility baseline is `0.165.0`; only a newer public `client_version` may be read from an optional local Codex cache, never cached identity/models/credentials.
+
+See [security notes](<SECURITY.md>), [third-party notices](<THIRD_PARTY_NOTICES.md>) and the [Chinese guide](<README.zh-CN.md>).

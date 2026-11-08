@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {getEventListeners} from 'node:events';
-import {createTelemetry} from '../lib/telemetry-v024.mjs';
+import {createTelemetry} from '../lib/telemetry-v026.mjs';
+import {createTelemetry as createLegacyTelemetry} from '../lib/telemetry-v024.mjs';
+import {createEvidence, attachEvidence} from '../lib/evidence-v026.mjs';
 
 const done = (kind = 'stop', failure) => ({type: 'finish', reason: {kind, ...(failure ? {failure} : {})}});
 const usage = value => ({type: 'usage', usage: value});
@@ -31,8 +33,10 @@ test('initial DTO exposes capability, fixed capacity and empty nullable metrics'
   assert.equal(s.since, '1970-01-01T00:00:00.000Z');
   assert.deepEqual(s.entries, []);
   assert.deepEqual(s.summary, {total: 0, running: 0, success: 0, error: 0, cancelled: 0,
-    inputTokens: 0, outputTokens: 0, avgTtftMs: null, avgDurationMs: null, avgTps: null, avgCacheHitRate: null,
-    samples: {ttft: 0, tps: 0, cacheHitRate: 0}, estimatedCostUsd: 0, pricedRequests: 0, unpricedRequests: 0, upperBoundRequests: 0});
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0,
+    avgTtftMs: null, avgDurationMs: null, avgTps: null, avgCacheHitRate: null,
+    samples: {ttft: 0, tps: 0, cacheHitRate: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0},
+    estimatedCostUsd: 0, pricedRequests: 0, unpricedRequests: 0, upperBoundRequests: 0});
   for (const limit of [0, -1, 1001, 1.5, NaN, Infinity, '200', null]) assert.throws(() => createTelemetry({}, {limit}), /invalid-telemetry-limit/);
   assert.throws(() => createTelemetry({}, {now: null}), /invalid-telemetry-clock/);
 });
@@ -74,8 +78,10 @@ test('complete prompt input, token TTFT, elapsed time and TPS use observed value
   })()));
   assert.deepEqual(result, frames);
   const s = f.telemetry.snapshot(), e = s.entries[0];
-  assert.deepEqual(e, {id: 'cpa-1', source: 'conversation', model: 'synthetic-model',
-    startedAt: '1970-01-01T00:00:00.000Z', endedAt: '1970-01-01T00:00:01.100Z',
+  assert.deepEqual(e, {id: 'cpa-1', source: 'conversation', provider: 'openai-codex', model: 'synthetic-model',
+    accountId: null, accountEmail: null, startedAt: '1970-01-01T00:00:00.000Z',
+    finishReason: 'stop', usageEvidence: 'host-normalized', serviceTierRequested: null, serviceTierReported: null,
+    priceModel: null, priceBasis: 'openai-standard-reference',
     status: 'success', httpStatus: null, errorCode: null, inputTokens: 100, outputTokens: 50,
     cacheHitRate: 0.6, cacheReadTokens: 60, cacheWriteTokens: 20,
     estimatedCostUsd: null, costBasis: 'unknown', ttftMs: 100, durationMs: 1100, tps: 50});
@@ -111,7 +117,8 @@ test('usage/finish and empty or malformed deltas do not invent a first token', a
     usage({inputTokens: 2, outputTokens: 3, totalTokens: 5}), done())));
   const e = f.telemetry.snapshot().entries[0];
   assert.equal(e.ttftMs, null); assert.equal(e.tps, null);
-  assert.deepEqual(f.telemetry.snapshot().summary.samples, {ttft: 0, tps: 0, cacheHitRate: 1});
+  assert.deepEqual(f.telemetry.snapshot().summary.samples, {ttft: 0, tps: 0, cacheHitRate: 0,
+    inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0});
 });
 
 test('real pi-ai tool delta starts TTFT at argumentsDelta after ID-only metadata', async t => {
@@ -143,25 +150,25 @@ test('tool IDs and completed block metadata alone never create a token timing sa
   assert.equal(f.telemetry.snapshot().summary.samples.ttft, 0);
 });
 
-test('Codex cache accounting distinguishes known, derived-zero and unavailable', async t => {
+test('legacy cache accounting preserves positives but never derives exact zero', async t => {
   const cases = [
     [{inputTokens: 20, outputTokens: 10, totalTokens: 110, cacheReadTokens: 80}, 100, 0.8],
     [{inputTokens: 20, outputTokens: 10, totalTokens: 110, cacheReadTokens: 60, cacheWriteTokens: 20}, 100, 0.6],
-    [{inputTokens: 20, outputTokens: 10, totalTokens: 30}, 20, 0],
-    [{inputTokens: 20, outputTokens: 10, totalTokens: 35, cacheWriteTokens: 5}, 25, 0],
+    [{inputTokens: 20, outputTokens: 10, totalTokens: 30}, 20, null],
+    [{inputTokens: 20, outputTokens: 10, totalTokens: 35, cacheWriteTokens: 5}, 25, null],
     [{inputTokens: 20, outputTokens: 10, totalTokens: 35}, 25, null],
     [{inputTokens: 20, outputTokens: 10}, null, null],
-    [{inputTokens: 20, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0}, 20, 0],
+    [{inputTokens: 20, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0}, null, null],
     [{inputTokens: 20, outputTokens: 10, cacheReadTokens: 5, cacheWriteTokens: 5}, 30, 1 / 6],
     [{outputTokens: 10, totalTokens: 30, cacheReadTokens: 5}, 20, 0.25],
     [{outputTokens: 10, totalTokens: 30}, 20, null],
-    [{inputTokens: 0, outputTokens: 10, totalTokens: 10}, 0, null],
-    [{inputTokens: 0, outputTokens: 0, totalTokens: 0}, 0, null],
+    [{inputTokens: 0, outputTokens: 10, totalTokens: 10}, null, null],
+    [{inputTokens: 0, outputTokens: 0, totalTokens: 0}, null, null],
     [{inputTokens: 20, outputTokens: 10, totalTokens: 30, cacheReadTokens: null}, 20, null],
     [{inputTokens: 20, outputTokens: 10, totalTokens: 30, cacheWriteTokens: false}, 20, null],
     [{inputTokens: 20, outputTokens: 10, totalTokens: 20}, null, null],
     [{inputTokens: 20, outputTokens: 10, totalTokens: 30, cacheReadTokens: 5}, null, null],
-    [{inputTokens: 20, outputTokens: 10, totalTokens: 35, cacheReadTokens: 0, cacheWriteTokens: 0}, null, null],
+    [{inputTokens: 20, outputTokens: 10, totalTokens: 35, cacheReadTokens: 0, cacheWriteTokens: 0}, 25, null],
     [{inputTokens: 0, outputTokens: 10, totalTokens: 5}, null, null],
     [{inputTokens: Number.MAX_SAFE_INTEGER, cacheReadTokens: 1, cacheWriteTokens: 0}, null, null],
   ];
@@ -197,9 +204,10 @@ test('missing usage remains unknown and absent metrics never enter means', async
   })()));
   const s = f.telemetry.snapshot();
   assert.equal(s.entries[1].inputTokens, null); assert.equal(s.entries[1].outputTokens, null);
-  assert.equal(s.summary.avgTtftMs, 20); assert.equal(s.summary.avgTps, 0); assert.equal(s.summary.avgCacheHitRate, 0);
+  assert.equal(s.summary.avgTtftMs, 20); assert.equal(s.summary.avgTps, null); assert.equal(s.summary.avgCacheHitRate, null);
   assert.equal(s.summary.avgDurationMs, 510);
-  assert.deepEqual(s.summary.samples, {ttft: 1, tps: 1, cacheHitRate: 1});
+  assert.deepEqual(s.summary.samples, {ttft: 1, tps: 0, cacheHitRate: 0,
+    inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0});
 });
 
 test('zero/negative generation duration yields unknown TPS, not infinity', async t => {
@@ -249,7 +257,7 @@ test('normal terminal reasons and failures settle exactly once', async t => {
   }
   const s = f.telemetry.snapshot().summary;
   assert.equal(s.total, 6); assert.equal(s.running, 0); assert.equal(s.success, 3); assert.equal(s.error, 2); assert.equal(s.cancelled, 1);
-  assert.equal(s.inputTokens, 0); assert.equal(s.outputTokens, 0);
+  assert.equal(s.inputTokens, null); assert.equal(s.outputTokens, null);
 });
 
 test('exhaustion without finish records STREAM_CLOSED, not success', async t => {
@@ -371,15 +379,15 @@ test('snapshots are detached and means include only finite observed samples', as
   await collect(f.hook(options(), () => chunks(usage({inputTokens: 2, outputTokens: 2, totalTokens: 4}), done())));
   await collect(f.hook(options(), () => chunks(usage({inputTokens: 2, outputTokens: 2, totalTokens: 6, cacheReadTokens: 2}), done())));
   const s = f.telemetry.snapshot();
-  assert.equal(s.summary.avgCacheHitRate, 0.25); assert.equal(s.summary.samples.cacheHitRate, 2);
+  assert.equal(s.summary.avgCacheHitRate, 0.5); assert.equal(s.summary.samples.cacheHitRate, 1);
   s.entries[0].status = 'fake'; s.entries.push({}); s.summary.total = -1; s.summary.samples.cacheHitRate = -1;
   const actual = f.telemetry.snapshot();
   assert.equal(actual.entries.length, 2); assert.equal(actual.entries[0].status, 'success');
-  assert.equal(actual.summary.total, 2); assert.equal(actual.summary.samples.cacheHitRate, 2);
+  assert.equal(actual.summary.total, 2); assert.equal(actual.summary.samples.cacheHitRate, 1);
 });
 
 for (const clone of [false, true]) {
-  test('probe is lazy and deduplicated through hook by ' + (clone ? 'signal' : 'options identity'), async t => {
+  test('probe is lazy and deduplicated through its private SDK chain with ' + (clone ? 'cloned options' : 'original options'), async t => {
     const f = fixture(t), request = options({signal: new AbortController().signal});
     let calls = 0;
     const stream = f.telemetry.observeProbe(request, () => {
@@ -451,17 +459,21 @@ test('a failing hook disposer cannot interrupt an in-flight conversation', async
   assert.equal(closed, 1); assert.equal(telemetry.snapshot().summary.total, 0);
 });
 
-test('cache counters remain nullable unless cumulative accounting proves exact zero', async t => {
-  const zero = await sample(t, {inputTokens: 20, outputTokens: 10, totalTokens: 30});
-  assert.equal(zero.cacheReadTokens, 0); assert.equal(zero.cacheWriteTokens, 0);
+test('Host totals cannot prove missing or normalized zero cache counters', async t => {
+  for (const counts of [
+    {inputTokens: 20, outputTokens: 10, totalTokens: 30},
+    {inputTokens: 20, outputTokens: 10, totalTokens: 30, cacheReadTokens: 0, cacheWriteTokens: 0},
+    {inputTokens: 20, outputTokens: 10, totalTokens: 35},
+    {inputTokens: 20, outputTokens: 10, totalTokens: 30, cacheReadTokens: null},
+  ]) {
+    const row = await sample(t, counts);
+    assert.equal(row.cacheReadTokens, null); assert.equal(row.cacheWriteTokens, null);
+    assert.equal(row.cacheHitRate, null); assert.equal(row.usageEvidence, 'host-normalized');
+  }
   const read = await sample(t, {inputTokens: 20, outputTokens: 10, totalTokens: 35, cacheReadTokens: 5});
-  assert.equal(read.cacheReadTokens, 5); assert.equal(read.cacheWriteTokens, 0);
+  assert.equal(read.cacheReadTokens, 5); assert.equal(read.cacheWriteTokens, null);
   const write = await sample(t, {inputTokens: 20, outputTokens: 10, totalTokens: 35, cacheWriteTokens: 5});
-  assert.equal(write.cacheReadTokens, 0); assert.equal(write.cacheWriteTokens, 5);
-  const unknown = await sample(t, {inputTokens: 20, outputTokens: 10, totalTokens: 35});
-  assert.equal(unknown.cacheReadTokens, null); assert.equal(unknown.cacheWriteTokens, null);
-  const bad = await sample(t, {inputTokens: 20, outputTokens: 10, totalTokens: 30, cacheReadTokens: null});
-  assert.equal(bad.cacheReadTokens, null); assert.equal(bad.cacheWriteTokens, null);
+  assert.equal(write.cacheReadTokens, null); assert.equal(write.cacheWriteTokens, 5);
 });
 
 test('verified Standard price estimates aggregate with coverage and upper-bound counts', async t => {
@@ -471,7 +483,7 @@ test('verified Standard price estimates aggregate with coverage and upper-bound 
     ['gpt-5.4', {inputTokens: 60, outputTokens: 20, totalTokens: 120}, 0.00055, 'upper-bound'],
     ['synthetic-model', {inputTokens: 60, outputTokens: 20, totalTokens: 80}, null, 'unknown'],
     ['gpt-5.4', {inputTokens: 60, outputTokens: 20}, null, 'unknown'],
-    ['gpt-6.1-sol', {inputTokens: 100, outputTokens: 20, totalTokens: 120}, 0.0004, 'estimate'],
+    ['gpt-6.1-sol', {inputTokens: 100, outputTokens: 20, totalTokens: 120}, null, 'unknown'],
     ['gpt-6.1-sol', {inputTokens: 50, outputTokens: 20, totalTokens: 120, cacheReadTokens: 40, cacheWriteTokens: 10}, 0.000354, 'upper-bound'],
     ['gpt-6.1-sol', {inputTokens: 50, outputTokens: 20, totalTokens: 120, cacheReadTokens: 40}, null, 'unknown'],
   ];
@@ -482,9 +494,9 @@ test('verified Standard price estimates aggregate with coverage and upper-bound 
   }
   const s = f.telemetry.snapshot();
   assert.equal(s.entries.length, 2); assert.equal(s.summary.total, 7);
-  assert.equal(s.summary.pricedRequests, 4); assert.equal(s.summary.unpricedRequests, 3);
+  assert.equal(s.summary.pricedRequests, 3); assert.equal(s.summary.unpricedRequests, 4);
   assert.equal(s.summary.upperBoundRequests, 2);
-  assert.ok(Math.abs(s.summary.estimatedCostUsd - 0.001764) < 1e-12);
+  assert.ok(Math.abs(s.summary.estimatedCostUsd - 0.001364) < 1e-12);
   assert.equal(s.pricing.currency, 'USD'); assert.equal(s.pricing.basis, 'OpenAI Standard API');
   assert.equal(s.pricing.checkedAt, '2026-11-08');
   assert.ok(s.pricing.sources.includes('https://developers.openai.com/api/docs/pricing.md'));
@@ -495,16 +507,359 @@ test('verified Standard price estimates aggregate with coverage and upper-bound 
   assert.equal(f.telemetry.snapshot().summary.pricedRequests, 0);
 });
 
-test('known zero cost is distinct from missing usage and cumulative cost is charged once', async t => {
-  const f = fixture(t);
-  await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(done())));
+test('only explicit raw zero can price zero; Host defaultusage stays unknown', async t => {
+  const f = fixture(t), request = options({model: 'gpt-5.4'});
+  await collect(f.hook(request, () => chunks(done())));
   assert.equal(f.telemetry.snapshot().entries[0].estimatedCostUsd, null);
-  await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(usage({inputTokens: 0, outputTokens: 0, totalTokens: 0}), done())));
-  assert.equal(f.telemetry.snapshot().entries[0].estimatedCostUsd, 0);
-  await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(
+  await collect(f.hook(request, () => chunks(usage({inputTokens: 0, outputTokens: 0, totalTokens: 0}), done('error'))));
+  const missing = f.telemetry.snapshot().entries[0];
+  assert.equal(missing.estimatedCostUsd, null); assert.equal(missing.usageEvidence, 'unavailable');
+  const audit = createEvidence();
+  audit.onRawEvent({type: 'response.completed', response: {usage: {input_tokens: 0, output_tokens: 0, total_tokens: 0,
+    input_tokens_details: {cached_tokens: 0, cache_write_tokens: 0}}}});
+  await collect(f.hook(request, () => chunks(attachEvidence(done(), audit))));
+  const zero = f.telemetry.snapshot().entries[0];
+  assert.equal(zero.estimatedCostUsd, 0); assert.equal(zero.usageEvidence, 'provider');
+  assert.equal(zero.inputTokens, 0); assert.equal(zero.outputTokens, 0); assert.equal(zero.cacheReadTokens, 0);
+  await collect(f.hook(request, () => chunks(
     usage({inputTokens: 10, outputTokens: 1, totalTokens: 11}),
     usage({inputTokens: 10, outputTokens: 2, totalTokens: 12}), done(), done())));
   const s = f.telemetry.snapshot();
-  assert.equal(s.summary.pricedRequests, 2); assert.equal(s.summary.unpricedRequests, 1);
+  assert.equal(s.summary.pricedRequests, 2); assert.equal(s.summary.unpricedRequests, 2);
   assert.equal(s.summary.estimatedCostUsd, (10 * 2.5 + 2 * 15) / 1_000_000);
+});
+
+const rawEvent = (counts, extra = {}) => ({type: 'response.completed', response: {usage: counts, ...extra}});
+const tagAll = (audit, ...frames) => frames.map(frame => attachEvidence(frame, audit));
+const rawCounts = (extra = {}) => ({input_tokens: 100, output_tokens: 20, total_tokens: 120,
+  input_tokens_details: {cached_tokens: 40, cache_write_tokens: 0}, ...extra});
+
+test('only registered CPA routes plus native Codex are observed, with reference-counted disposers', async t => {
+  const f = fixture(t), provider = 'cpa-codex-account-a';
+  for (const invalid of [undefined, null, 5, '', 'openai-codex', 'cpa-codex-', 'cpa-codex-../escape', 'cpa-codex-a b']) {
+    assert.throws(() => f.telemetry.registerProvider(invalid), /invalid-telemetry-provider/);
+  }
+  const before = chunks(done());
+  assert.equal(f.hook(options({provider}), () => before), before);
+  await collect(f.telemetry.observeProbe(options({provider}), () => chunks(done())));
+  assert.equal(f.telemetry.snapshot().summary.total, 0);
+  const first = f.telemetry.registerProvider(provider), second = f.telemetry.registerProvider(provider);
+  await collect(f.hook(options({provider}), () => chunks(done())));
+  first(); first();
+  await collect(f.hook(options({provider}), () => chunks(done())));
+  assert.equal(f.telemetry.snapshot().summary.total, 2);
+  second(); second();
+  const after = chunks(done());
+  assert.equal(f.hook(options({provider}), () => after), after);
+  const lookalike = chunks(done());
+  assert.equal(f.hook(options({provider: provider + '-not-registered'}), () => lookalike), lookalike);
+  await collect(f.hook(options(), () => chunks(done())));
+  assert.equal(f.telemetry.snapshot().summary.total, 3);
+  f.telemetry.dispose(); assert.doesNotThrow(() => f.telemetry.registerProvider(provider)());
+});
+
+test('raw provider proof overrides Host defaults without double-counting cache or reasoning', async t => {
+  const f = fixture(t), provider = 'cpa-codex-account-a'; f.telemetry.registerProvider(provider);
+  const audit = createEvidence({accountId: 'account-a', accountEmail: 'a@example.test', serviceTierRequested: 'priority'});
+  audit.onHttpStatus(200);
+  audit.onRawEvent(rawEvent(rawCounts({output_tokens_details: {reasoning_tokens: 10}}), {service_tier: 'default',
+    output: ['private-output'], headers: {authorization: 'private-token'}}));
+  const frames = tagAll(audit, usage({inputTokens: 0, outputTokens: 0, totalTokens: 0}), done());
+  const output = await collect(f.hook(options({provider, model: 'gpt-5.4', serviceTier: 'priority',
+    accountId: 'spoof-account', accountEmail: 'spoof@example.test'}), () => chunks(...frames)));
+  assert.equal(output[0], frames[0]); assert.equal(output[1], frames[1]);
+  const row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.inputTokens, 100); assert.equal(row.outputTokens, 20);
+  assert.equal(row.cacheReadTokens, 40); assert.equal(row.cacheWriteTokens, 0); assert.equal(row.cacheHitRate, 0.4);
+  assert.equal(row.accountId, 'account-a'); assert.equal(row.accountEmail, 'a@example.test');
+  assert.equal(row.provider, provider); assert.equal(row.httpStatus, 200); assert.equal(row.usageEvidence, 'provider');
+  assert.equal(row.estimatedCostUsd, 0.00046); assert.equal(row.costBasis, 'estimate');
+  assert.equal(row.priceModel, 'gpt-5.4'); assert.equal(row.priceBasis, 'openai-standard-reference');
+  assert.equal(row.serviceTierRequested, 'priority'); assert.equal(row.serviceTierReported, 'default');
+  assert.equal(row.finishReason, 'stop');
+  const serialized = JSON.stringify(f.telemetry.snapshot());
+  for (const privateValue of ['private-', 'spoof-account', 'spoof@example.test', 'reasoningTokens', 'evidenceId', 'endedAt']) {
+    assert.equal(serialized.includes(privateValue), false, privateValue);
+  }
+});
+
+test('priority request alone and native options never confirm a served tier or HTTP success', async t => {
+  const f = fixture(t), audit = createEvidence({serviceTierRequested: 'priority'});
+  await collect(f.hook(options({model: 'gpt-5.4', serviceTier: 'priority'}), () => chunks(attachEvidence(done(), audit))));
+  let row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.serviceTierRequested, 'priority'); assert.equal(row.serviceTierReported, null); assert.equal(row.httpStatus, null);
+  await collect(f.hook(options({serviceTier: 'priority', accountId: 'untrusted-account', accountEmail: 'untrusted@example.test'}), () => chunks(done())));
+  row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.serviceTierRequested, null); assert.equal(row.serviceTierReported, null);
+  assert.equal(row.accountId, null); assert.equal(row.accountEmail, null); assert.equal(row.httpStatus, null);
+});
+
+test('missing and malformed raw usage never fall back to normalized counts', async t => {
+  const f = fixture(t);
+  for (const raw of [undefined, null, false, [], {}, {output_tokens: 10, total_tokens: 30},
+    {input_tokens: '20', output_tokens: 10, total_tokens: 30}]) {
+    const audit = createEvidence(); audit.onRawEvent(rawEvent(raw));
+    await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(
+      usage({inputTokens: 20, outputTokens: 10, totalTokens: 30}), attachEvidence(done(), audit))));
+    const row = f.telemetry.snapshot().entries[0];
+    assert.equal(row.inputTokens, null); assert.equal(row.estimatedCostUsd, null);
+    assert.equal(row.cacheReadTokens, null); assert.equal(row.cacheWriteTokens, null);
+    assert.equal(row.usageEvidence, raw && !Array.isArray(raw) && typeof raw === 'object' ? 'provider' : 'unavailable');
+  }
+});
+
+test('raw cache absence stays null, raw zero survives, and malformed raw fields prevent pricing', async t => {
+  const f = fixture(t);
+  const cases = [
+    [{input_tokens: 20, output_tokens: 10, total_tokens: 30}, null, null, 0.0002, 'upper-bound'],
+    [{input_tokens: 20, output_tokens: 10, total_tokens: 30, input_tokens_details: {cached_tokens: 0}}, 0, null, 0.0002, 'estimate'],
+    [{input_tokens: 20, output_tokens: 10, total_tokens: 30, input_tokens_details: {cached_tokens: null}}, null, null, 0.0002, 'upper-bound'],
+    [{input_tokens: 20, output_tokens: 10, total_tokens: 30, input_tokens_details: {cached_tokens: false}}, null, null, null, 'unknown'],
+    [{input_tokens: 20, output_tokens: 10, total_tokens: '30', input_tokens_details: {cached_tokens: 0}}, 0, null, null, 'unknown'],
+    [{input_tokens: 20, output_tokens: 10, total_tokens: 29, input_tokens_details: {cached_tokens: 0}}, 0, null, null, 'unknown'],
+    [{input_tokens: 20, output_tokens: 10, input_tokens_details: []}, null, null, null, 'unknown'],
+    [{input_tokens: 20, output_tokens: 10, input_tokens_details: {cached_tokens: 21}}, 21, null, null, 'unknown'],
+  ];
+  for (const [raw, read, write, cost, basis] of cases) {
+    const audit = createEvidence(); audit.onRawEvent(rawEvent(raw));
+    await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(attachEvidence(done(), audit))));
+    const row = f.telemetry.snapshot().entries[0];
+    assert.equal(row.cacheReadTokens, read); assert.equal(row.cacheWriteTokens, write);
+    assert.equal(row.estimatedCostUsd, cost); assert.equal(row.costBasis, basis);
+  }
+});
+
+test('raw GPT-6 write-cache absence remains unpriced, while confirmed zero permits reference pricing', async t => {
+  const f = fixture(t);
+  for (const write of [undefined, null, false, 0, 10]) {
+    const audit = createEvidence();
+    audit.onRawEvent(rawEvent(rawCounts({input_tokens_details: {cached_tokens: 40, cache_write_tokens: write}})));
+    await collect(f.hook(options({model: 'gpt-6.1-sol'}), () => chunks(attachEvidence(done(), audit))));
+    const row = f.telemetry.snapshot().entries[0];
+    if (write === 0 || write === 10) {
+      assert.equal(row.estimatedCostUsd, write === 0 ? 0.000324 : 0.000354);
+      assert.equal(row.costBasis, write === 0 ? 'estimate' : 'upper-bound'); assert.equal(row.priceModel, 'gpt-6.1-sol');
+    } else { assert.equal(row.estimatedCostUsd, null); assert.equal(row.cacheWriteTokens, null); }
+  }
+});
+
+test('malformed legacy totals cannot become apparently valid reference estimates', async t => {
+  const f = fixture(t);
+  for (const totalTokens of [false, '120', -1, Infinity]) {
+    await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(
+      usage({inputTokens: 50, outputTokens: 20, cacheReadTokens: 40, cacheWriteTokens: 10, totalTokens}), done())));
+    assert.equal(f.telemetry.snapshot().entries[0].estimatedCostUsd, null);
+  }
+});
+
+test('concurrent accounts sharing model and AbortSignal keep each call audit independent', async t => {
+  const f = fixture(t), signal = new AbortController().signal;
+  const a = createEvidence({accountId: 'a', accountEmail: 'a@example.test', serviceTierRequested: 'priority'});
+  const b = createEvidence({accountId: 'b', accountEmail: 'b@example.test'});
+  a.onHttpStatus(200); a.onRawEvent(rawEvent(rawCounts()));
+  b.onHttpStatus(429);
+  const providerA = 'cpa-codex-a', providerB = 'cpa-codex-b';
+  f.telemetry.registerProvider(providerA); f.telemetry.registerProvider(providerB);
+  const first = f.hook(options({provider: providerA, model: 'gpt-5.4', signal}), () => chunks(...tagAll(a, text('private-a'), done())));
+  const second = f.hook(options({provider: providerB, model: 'gpt-5.4', signal}), () => chunks(...tagAll(b, text('private-b'), done('error', {code: 'RATE_LIMIT'}))));
+  await first.next(); await second.next(); await collect(second); await collect(first);
+  const [rowB, rowA] = f.telemetry.snapshot().entries;
+  assert.equal(rowA.accountId, 'a'); assert.equal(rowA.httpStatus, 200); assert.equal(rowA.inputTokens, 100);
+  assert.equal(rowA.estimatedCostUsd, 0.00046); assert.equal(rowA.serviceTierRequested, 'priority');
+  assert.equal(rowB.accountId, 'b'); assert.equal(rowB.httpStatus, 429); assert.equal(rowB.inputTokens, null);
+  assert.equal(rowB.estimatedCostUsd, null); assert.equal(rowB.serviceTierRequested, null);
+  assert.equal(rowB.errorCode, 'RATE_LIMIT'); assert.equal(rowB.finishReason, 'error');
+});
+
+test('conflicting audit IDs in one stream fail closed instead of mixing request metadata', async t => {
+  const f = fixture(t), a = createEvidence({accountId: 'a'}), b = createEvidence({accountId: 'b'});
+  a.onHttpStatus(200); a.onRawEvent(rawEvent(rawCounts())); b.onHttpStatus(429); b.onRawEvent(rawEvent(rawCounts()));
+  await collect(f.hook(options({model: 'gpt-5.4'}), () => chunks(attachEvidence(text('x'), a),
+    attachEvidence(usage({inputTokens: 1, outputTokens: 1}), b), attachEvidence(done(), a))));
+  const row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.accountId, null); assert.equal(row.httpStatus, null); assert.equal(row.estimatedCostUsd, null);
+  assert.equal(row.inputTokens, null); assert.equal(row.usageEvidence, 'unavailable');
+});
+
+test('synchronous and asynchronous tagged errors preserve identity and expose safe per-call evidence', async t => {
+  const f = fixture(t);
+  for (const synchronous of [true, false]) {
+    const audit = createEvidence({accountId: 'a', accountEmail: 'a@example.test'}); audit.onHttpStatus(401);
+    const failure = attachEvidence(Object.assign(Error('private-response'), {code: 'MISSING_CREDENTIAL',
+      headers: {authorization: 'private-token'}, requestId: 'private-id'}), audit);
+    const factory = synchronous ? () => { throw failure; } : async function* () { throw failure; };
+    await assert.rejects(async () => collect(f.hook(options(), factory)), error => error === failure);
+    const row = f.telemetry.snapshot().entries[0];
+    assert.equal(row.httpStatus, 401); assert.equal(row.errorCode, 'MISSING_CREDENTIAL'); assert.equal(row.accountId, 'a');
+    assert.equal(row.estimatedCostUsd, null); assert.equal(JSON.stringify(row).includes('private-'), false);
+  }
+});
+
+test('public SDK error codes and finish reasons are retained, not error message guesses', async t => {
+  const {LlmError, ACCOUNT_QUOTA_EXCEEDED_CODE, QUOTA_EXCEEDED_CODE, CONTEXT_WINDOW_EXCEEDED_CODE,
+    EMPTY_RESPONSE_CODE, INVALID_CREDENTIAL_CODE, IMAGE_OFFLOAD_REQUIRED_CODE} = await import('@deepseek-ai/dsh-llm');
+  const f = fixture(t);
+  const codes = [ACCOUNT_QUOTA_EXCEEDED_CODE, QUOTA_EXCEEDED_CODE, CONTEXT_WINDOW_EXCEEDED_CODE,
+    EMPTY_RESPONSE_CODE, INVALID_CREDENTIAL_CODE, IMAGE_OFFLOAD_REQUIRED_CODE, 'MISSING_CREDENTIAL',
+    'UNKNOWN_MODEL', 'UNSUPPORTED_OPTION', 'UNSUPPORTED_CONTENT', 'INVALID_REPLAY_STATE', 'REQUEST_HEADERS', 'INVALID_ARGS'];
+  for (const code of codes) {
+    const failure = new LlmError('private-error-text', code, {status: 429});
+    await assert.rejects(async () => collect(f.hook(options(), () => { throw failure; })), error => error === failure);
+    assert.equal(f.telemetry.snapshot().entries[0].errorCode, code);
+    assert.equal(f.telemetry.snapshot().entries[0].httpStatus, 429);
+  }
+  for (const kind of ['stop', 'tool-calls', 'max-tokens', 'error', 'aborted', 'private-finish']) {
+    await collect(f.hook(options(), () => chunks(done(kind))));
+    assert.equal(f.telemetry.snapshot().entries[0].finishReason, kind === 'private-finish' ? null : kind);
+  }
+});
+
+test('probe SDK dispatch after await is counted once, unrelated same-signal calls remain conversations', async t => {
+  const f = fixture(t), request = options({signal: new AbortController().signal});
+  const entered = deferred(), release = deferred();
+  const probe = f.telemetry.observeProbe(request, () => (async function* () {
+    entered.resolve(); await release.promise;
+    yield* f.hook({...request}, () => chunks(text('probe'), done()));
+  })());
+  const pending = probe.next(); await entered.promise;
+  await collect(f.hook(request, () => chunks(done())));
+  release.resolve(); await pending; await collect(probe);
+  await collect(f.hook(request, () => chunks(done())));
+  const rows = f.telemetry.snapshot().entries;
+  assert.equal(rows.length, 3); assert.deepEqual(rows.map(row => row.source), ['conversation', 'conversation', 'pelican']);
+  assert.equal(f.telemetry.snapshot().summary.total, 3);
+});
+
+test('token sums disclose sample coverage and explicit raw zero participates in timing/rate samples', async t => {
+  const f = fixture(t);
+  await collect(f.hook(options(), () => chunks(done())));
+  assert.equal(f.telemetry.snapshot().summary.inputTokens, null); assert.equal(f.telemetry.snapshot().summary.samples.inputTokens, 0);
+  const audit = createEvidence();
+  audit.onRawEvent(rawEvent({input_tokens: 20, output_tokens: 0, total_tokens: 20,
+    input_tokens_details: {cached_tokens: 0, cache_write_tokens: 0}}));
+  await collect(f.hook(options(), () => (async function* () {
+    f.tick(10); yield attachEvidence(text('x'), audit);
+    f.tick(1010); yield attachEvidence(done(), audit);
+  })()));
+  const s = f.telemetry.snapshot();
+  assert.equal(s.summary.inputTokens, 20); assert.equal(s.summary.outputTokens, 0);
+  assert.equal(s.summary.cacheReadTokens, 0); assert.equal(s.summary.cacheWriteTokens, 0);
+  assert.deepEqual(s.summary.samples, {ttft: 1, tps: 1, cacheHitRate: 1, inputTokens: 1, outputTokens: 1, cacheReadTokens: 1, cacheWriteTokens: 1});
+  assert.equal(s.summary.avgTps, 0); assert.equal(s.summary.avgCacheHitRate, 0);
+  assert.equal(s.entries[0].tps, 0); assert.equal(s.entries[1].outputTokens, null);
+});
+
+test('onRecord gets one detached terminal whitelist row and never waits for disk backpressure', {timeout: 2000}, async t => {
+  const rows = [], gate = deferred();
+  const f = fixture(t, {onRecord(row) { rows.push(row); return gate.promise; }});
+  const end = done(), stream = f.hook(options(), () => chunks(text('private-output'), end, done('error')));
+  assert.equal(rows.length, 0);
+  await stream.next(); assert.equal(rows.length, 0);
+  assert.equal((await stream.next()).value, end);
+  assert.equal(rows.length, 1); assert.equal(f.telemetry.snapshot().recording.pending, 1);
+  await collect(stream); assert.equal(rows.length, 1);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ['id', 'source', 'startedAt', 'provider', 'model', 'accountId', 'accountEmail',
+    'status', 'finishReason', 'httpStatus', 'errorCode', 'serviceTierRequested', 'serviceTierReported', 'usageEvidence',
+    'priceBasis', 'priceModel', 'cacheHitRate', 'inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens',
+    'estimatedCostUsd', 'costBasis', 'ttftMs', 'durationMs', 'tps'].sort());
+  assert.equal(rows[0].status, 'success'); assert.equal(Object.hasOwn(rows[0], 'endedAt'), false);
+  rows[0].status = 'fake'; rows[0].accountEmail = 'fake@example.test';
+  assert.equal(f.telemetry.snapshot().entries[0].status, 'success'); assert.equal(f.telemetry.snapshot().entries[0].accountEmail, null);
+  gate.resolve(); await new Promise(setImmediate);
+  assert.deepEqual(f.telemetry.snapshot().recording, {pending: 0, failed: 0, error: null});
+});
+
+test('synchronous sink throws, rejected promises, and hostile thenables are observed with a safe error', async t => {
+  for (const sink of [() => { throw Error('private-disk-error'); }, () => Promise.reject(Error('private-disk-error')),
+    () => ({get then() { throw Error('private-disk-error'); }})]) {
+    const f = fixture(t, {onRecord: sink});
+    await collect(f.hook(options(), () => chunks(done())));
+    await new Promise(setImmediate);
+    const s = f.telemetry.snapshot();
+    assert.equal(s.entries[0].status, 'success');
+    assert.deepEqual(s.recording, {pending: 0, failed: 1, error: 'record-write-failed'});
+    assert.equal(JSON.stringify(s).includes('private-disk-error'), false);
+  }
+  assert.throws(() => createTelemetry({}, {onRecord: false}), /invalid-telemetry-sink/);
+});
+
+test('RAM eviction never suppresses terminal persistence, while clear invalidates old in-flight rows', async t => {
+  const rows = [], f = fixture(t, {limit: 1, onRecord(row) { rows.push(row); }}), streams = [];
+  for (let i = 0; i < 5; i++) {
+    const stream = f.hook(options(), () => chunks(text('x'), done())); streams.push(stream); await stream.next();
+  }
+  for (const stream of streams) await collect(stream);
+  assert.equal(f.telemetry.snapshot().entries.length, 1); assert.equal(rows.length, 5);
+  const stale = f.hook(options(), () => chunks(text('old'), done())); await stale.next();
+  f.telemetry.clear(); await collect(stale); assert.equal(rows.length, 5);
+  await collect(f.hook(options(), () => chunks(done()))); assert.equal(rows.length, 6);
+  assert.equal(new Set(rows.map(row => row.id)).size, 6);
+});
+
+test('abort/error/iterator-return terminals each persist once despite late upstream results', async t => {
+  const rows = [], f = fixture(t, {onRecord(row) { rows.push(row); }}), controller = new AbortController();
+  const stream = f.telemetry.observeProbe(options({signal: controller.signal}), () => chunks(text('x'), done(), done('error')));
+  await stream.next(); controller.abort(); assert.equal(rows.length, 1); assert.equal(rows[0].status, 'cancelled');
+  await collect(stream); assert.equal(rows.length, 1);
+  const returned = f.hook(options(), () => chunks(text('x'), done())); await returned.next(); await returned.return();
+  assert.equal(rows.length, 2); assert.equal(rows[1].status, 'cancelled');
+  const error = Error('private-error');
+  await assert.rejects(async () => collect(f.hook(options(), async function* () { throw error; })), value => value === error);
+  assert.equal(rows.length, 3); assert.equal(rows[2].status, 'error');
+});
+
+test('priceModel resolves only verified aliases and stays a Standard reference even for priority evidence', async t => {
+  const f = fixture(t), audit = createEvidence({serviceTierRequested: 'priority'});
+  audit.onRawEvent(rawEvent(rawCounts(), {service_tier: 'priority'}));
+  await collect(f.hook(options({model: 'gpt-5.4-2026-03-05'}), () => chunks(attachEvidence(done(), audit))));
+  const row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.model, 'gpt-5.4-2026-03-05'); assert.equal(row.priceModel, 'gpt-5.4');
+  assert.equal(row.priceBasis, 'openai-standard-reference'); assert.equal(row.estimatedCostUsd, 0.00046);
+  assert.equal(row.serviceTierReported, 'priority');
+});
+
+test('legacy telemetry module remains available to old cached entry imports', async () => {
+  let listener;
+  const legacy = createLegacyTelemetry({on(_, fn) { listener = fn; return () => {}; }}, {now: () => 0, dateNow: () => 0});
+  try { await collect(listener(options(), () => chunks(done()))); assert.equal(legacy.snapshot().summary.success, 1); }
+  finally { legacy.dispose(); }
+});
+
+test('single-account policy counters survive display eviction and manual clear without retaining rows', async t => {
+  const f = fixture(t, {limit: 1}), route = 'cpa-codex-a';
+  f.telemetry.registerProvider(route);
+  const stream = f.hook(options({provider: route}), () => chunks(text('hold'), done()));
+  assert.equal(f.telemetry.hasRunningConversation(route), false);
+  await stream.next();
+  assert.equal(f.telemetry.hasRunningConversation(route), true);
+  await collect(f.hook(options({provider: route}), () => chunks(done())));
+  assert.equal(f.telemetry.snapshot().entries[0].status, 'success');
+  assert.equal(f.telemetry.hasRunningConversation(route), true);
+  f.telemetry.clear();
+  assert.equal(f.telemetry.snapshot().summary.running, 0);
+  assert.equal(f.telemetry.hasRunningConversation(route), true);
+  await stream.return();
+  assert.equal(f.telemetry.hasRunningConversation(route), false);
+});
+
+test('independent conversation counters release on done, return, throw, and disposal, not on probe work', async t => {
+  const f = fixture(t), route = 'cpa-codex-a';
+  f.telemetry.registerProvider(route);
+  const first = f.hook(options({provider: route}), () => chunks(text('a'), done()));
+  const second = f.hook(options({provider: route}), () => chunks(text('b'), done()));
+  await first.next(); await second.next();
+  await first.return(); assert.equal(f.telemetry.hasRunningConversation(route), true);
+  await collect(second); assert.equal(f.telemetry.hasRunningConversation(route), false);
+  const failed = f.hook(options({provider: route}), () => (async function* () {throw Error('synthetic private failure');})());
+  await assert.rejects(collect(failed)); assert.equal(f.telemetry.hasRunningConversation(route), false);
+  const probe = f.telemetry.observeProbe(options({provider: route}), () => chunks(text('probe'), done()));
+  await probe.next(); assert.equal(f.telemetry.hasRunningConversation(route), false); await probe.return();
+  const retired = f.hook(options({provider: route}), () => chunks(text('old'), done()));
+  await retired.next(); f.telemetry.dispose(); assert.equal(f.telemetry.hasRunningConversation(route), false); await retired.return();
+});
+
+for (const code of ['CPA_ACCOUNT_INACTIVE', 'CPA_BINDING_MISMATCH', 'CPA_TRANSPORT_FAILED']) test('fixed owned transport error survives the metadata allowlist: ' + code, async t => {
+  const f = fixture(t);
+  await collect(f.hook(options(), () => chunks(done('error', {code}))));
+  assert.equal(f.telemetry.snapshot().entries[0].errorCode, code);
 });
