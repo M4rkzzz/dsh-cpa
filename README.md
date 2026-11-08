@@ -4,6 +4,12 @@ Isolated ChatGPT Codex accounts, quota, real Fast, persistent request metadata a
 
 Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. The GitHub channel detects version bumps on the default branch without requiring a GitHub Release.
 
+## 0.2.8
+
+- Fix desktop updates rejected with `ERR_PNPM_IGNORED_BUILDS`: public PiAiAdapter/Codex SDK code is prebuilt before publishing, so consumers do not install the complete provider dependency graph. No dependency build approval or desktop policy change is needed.
+- CI validates clean pnpm 11.28.5 strict-build installs and post-install integration tests. An npm install with scripts disabled is not evidence that desktop updates work.
+- Release version: **0.2.8**; Git tag: **v0.2.8**, never a commit hash. Market 1.70.2 may still display its internal commit identifier for a GitHub source; that is Market presentation, not this package version.
+
 ## 0.2.7
 
 - Extract untrusted SVG text in linear time, with an absolute deadline covering synchronous processing.

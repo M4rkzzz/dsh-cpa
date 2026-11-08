@@ -25,12 +25,14 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-## Declared runtime dependencies (0.2.6)
+## Runtime and prebuilt SDK dependencies (0.2.8)
 
-These packages are installed as normal dependencies, not copied from an installed host archive. Their own licenses and transitive notices continue to apply; the plugin's MIT license does not relicense them.
+Public SDK sources are installed only in the development/build checkout, never copied from an installed host archive. PiAiAdapter and pi-ai runtime code is prebuilt into a JavaScript bundle, with pinned package provenance and a SHA-256 in [manifest.json](<lib/vendor/manifest.json>), full bundled license/notice texts under [vendor licenses](<lib/vendor/licenses/>), and reproducible generation by [build-sdk.mjs](<scripts/build-sdk.mjs>). The pi packages' omitted npm license file is supplied from the [pinned upstream MIT license](https://raw.githubusercontent.com/earendil-works/pi/v1.3.0/LICENSE). Other runtime dependencies retain their own package notices. Bundling does not execute dependency install/build scripts. These licenses continue to apply; the plugin's MIT license does not relicense third-party code.
 
 | Package | Pinned version | License | Upstream source |
 | --- | --- | --- | --- |
+| @anthropic-ai/sdk | 0.129.0 | Apache-2.0 | [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-typescript) |
+| @deepseek-ai/cordis | 4.1.0 | MIT | [Cordis](https://github.com/shigma/cordis) |
 | @deepseek-ai/dsh-llm | 0.2.2-rc.1 | MIT | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) |
 | @deepseek-ai/dsh-llm-pi-ai | 0.2.2-rc.1 | MIT | [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) |
 | @deepseek-ai/schemastery | 3.19.0 | MIT | [DeepSeek Harness vendor packages](https://github.com/deepseek-ai/deepseek-harness) |

@@ -4,6 +4,12 @@ ChatGPT Codex 多账号、额度、真实 Fast、持久请求日志和纯内存�
 
 通过 DSH Market 从 [GitHub 仓库](https://github.com/M4rkzzz/dsh-cpa)安装，或安装打包归档。默认分支的版本更新即可被 GitHub 来源检测，不依赖 GitHub Release。
 
+## 0.2.8
+
+- 修复桌面更新被 `ERR_PNPM_IGNORED_BUILDS` 阻断：公共 PiAiAdapter/Codex SDK 在发布前预构建，消费者不再安装整套 provider 依赖。无需批准第三方构建脚本，也不修改桌面安全策略。
+- CI 新增 pnpm 11.28.5 严格构建策略下的干净安装及安装后集成测试；npm 禁脚本安装不再被当作桌面更新成功的替代证据。
+- 发布版本为 **0.2.8**，Git 标签为 **v0.2.8**；不以提交哈希命名版本。Market 1.70.2 的 GitHub 来源更新提示仍可能显示内部提交标识，这是 Market 的显示逻辑，不是 CPA 的发布版本号。
+
 ## 0.2.7
 
 - 修复模型返回异常 SVG 文本时主线程提取的平方复杂度；绝对截止时间也覆盖同步处理。

@@ -1,12 +1,12 @@
 {
   "name": "dsh-cpa",
-  "version": "0.2.7",
+  "version": "0.2.8",
   "type": "module",
   "license": "MIT",
-  "main": "./lib/index-v027.mjs",
+  "main": "./lib/index-v028.mjs",
   "exports": {
-    ".": "./lib/index-v027.mjs",
-    "./client": "./lib/client-v027.js"
+    ".": "./lib/index-v028.mjs",
+    "./client": "./lib/client-v028.js"
   },
   "files": [
     "lib",
@@ -51,14 +51,23 @@
     "quota"
   ],
   "scripts": {
+    "test:install": "node scripts/verify-install.mjs",
+    "build:sdk": "node scripts/build-sdk.mjs",
+    "check:sdk": "node scripts/build-sdk.mjs --check",
     "test": "node --test --experimental-test-isolation=none tests/*.test.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "0.129.0",
+    "@deepseek-ai/cordis": "4.1.0",
     "@deepseek-ai/dsh-llm": "0.2.2-rc.1",
-    "@deepseek-ai/dsh-llm-pi-ai": "0.2.2-rc.1",
     "@deepseek-ai/schemastery": "3.19.0",
-    "@earendil-works/pi-ai": "1.3.0",
     "@resvg/resvg-wasm": "2.6.2",
     "saxes": "6.0.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-authorization": "0.2.2-rc.1",
+    "@deepseek-ai/dsh-llm-pi-ai": "0.2.2-rc.1",
+    "@earendil-works/pi-ai": "1.3.0",
+    "esbuild": "0.25.12"
   }
 }

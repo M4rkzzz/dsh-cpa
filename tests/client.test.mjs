@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v027.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v028.js',import.meta.url),'utf8');
 const MODEL='synthetic-model', A='a', B='b', email=id=>id+'@example.test', provider=id=>'cpa-codex-'+id;
 const account=(id=A,extra={})=>({id,provider:provider(id),email:email(id),owned:id!==A,enabled:id===A,
  availability:'ready',canRunProbe:id===A,models:[MODEL,'other-model'],quota:{windows:[

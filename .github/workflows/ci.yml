@@ -13,5 +13,10 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run check:sdk
       - run: npm test
-      - run: npm pack --dry-run --ignore-scripts
+      - run: npm pack --ignore-scripts
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.28.5
+      - run: pnpm run test:install

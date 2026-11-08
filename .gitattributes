@@ -1,0 +1,4 @@
+# Generated SDK checksums and reproducible build inputs must be byte-stable.
+# Preserve upstream license whitespace and whitespace inside generated JS strings.
+lib/vendor/** text eol=lf -whitespace
+scripts/** text eol=lf
