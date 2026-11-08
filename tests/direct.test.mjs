@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {getEventListeners} from 'node:events';
-import {parseUsage,readDirectUsage,readCatalog,catalogClientVersion} from '../lib/direct-v023.mjs';
+import {parseUsage,readDirectUsage,readCatalog,catalogClientVersion} from '../lib/direct-v024.mjs';
 
 const metadata=async()=>JSON.stringify({client_version:'0.165.0'});
 const record=()=>Object.freeze({kind:'grant',payload:Object.freeze({access:'synthetic-token',accountId:'synthetic-account',expires:Date.now()+60000})});

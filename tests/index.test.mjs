@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdtemp, writeFile, rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
-import {apply, sameOrigin} from '../lib/index-v023.mjs';
+import {apply, sameOrigin} from '../lib/index-v024.mjs';
 
 const NOW = 2000000000000;
 const grant = id => ({kind: 'grant', payload: {access: 'synthetic-token-' + id, accountId: 'synthetic-account-' + id, expires: NOW + 3600000}});
@@ -16,14 +16,15 @@ async function fixture(t, options = {}) {
   await writeFile(join(directory, 'models_cache.json'), JSON.stringify({client_version: '0.165.0'}));
   const oldHome = process.env.CODEX_HOME;
   process.env.CODEX_HOME = directory;
-  let now = NOW, record = options.record === undefined ? grant('a') : options.record, handler, removed = 0, nextTimer = 1;
+  let now = NOW, record = options.record === undefined ? grant('a') : options.record, handler, activityHandler, removed = 0, nextTimer = 1;
   let upstream = options.fetcher ?? (async url => {
     if (String(url).startsWith('https://chatgpt.com/backend-api/codex/models?')) return Response.json({models: [model()]});
     assert.equal(String(url), 'https://chatgpt.com/backend-api/wham/usage');
     return quota(12);
   });
-  const timers = new Map(), calls = [], mutations = [];
+  const timers = new Map(), listeners = new Map(), calls = [], mutations = [], modelCalls = [];
   t.mock.method(Date, 'now', () => now);
+  t.mock.method(performance, 'now', () => now - NOW);
   t.mock.method(globalThis, 'setTimeout', (fn, delay) => { const id = nextTimer++; timers.set(id, {fn, delay}); return id; });
   t.mock.method(globalThis, 'setInterval', (fn, delay) => { const id = nextTimer++; timers.set(id, {fn, delay, interval: true}); return id; });
   t.mock.method(globalThis, 'clearTimeout', id => timers.delete(id));
@@ -34,7 +35,19 @@ async function fixture(t, options = {}) {
   const ctx = {
     authorization: options.authorization ?? {begin: async () => { throw Error('unexpected-login'); }},
     credentials: {readRecord: async key => { assert.equal(key, 'llm-pi-ai/openai-codex'); return record; }},
-    llm: {listModels: async () => [{id: 'gpt-configured'}]},
+    llm: {
+      listModels: options.listModels ?? (async () => [{id: 'gpt-configured'}]),
+      stream: options.stream === null ? undefined : request => {
+        modelCalls.push(request);
+        const next = () => {
+          assert.equal(typeof options.stream, 'function', 'model calls must be explicitly mocked');
+          return options.stream(request);
+        };
+        const observe = listeners.get('llm/stream');
+        return observe ? observe(request, next) : next();
+      }
+    },
+    on: (event, listener) => { listeners.set(event, listener); return () => listeners.delete(event); },
     settings: {
       describe: () => [{ns: 'llm-pi-ai', value: settings, revision}],
       mutate: async (ns, ops, expected) => {
@@ -49,7 +62,11 @@ async function fixture(t, options = {}) {
       }
     },
     webServer: {getOrigin: () => 'http://localhost:7452'},
-    connection: {authenticatedUrl: origin => origin + '/synthetic-login', fetch: {register: route => { handler = route.fetch; return () => { removed++; }; }}},
+    connection: {authenticatedUrl: origin => origin + '/synthetic-login', fetch: {register: route => {
+      if (route.path === '/api/cpa-settings') handler = route.fetch;
+      else { assert.equal(route.path, '/api/cpa-activity'); activityHandler = route.fetch; }
+      return () => { removed++; };
+    }}},
     effect: () => {}
   };
   const dispose = apply(ctx);
@@ -62,7 +79,11 @@ async function fixture(t, options = {}) {
     method, headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
     ...(body === undefined ? {} : {body: JSON.stringify(body)})
   }));
-  return {ctx, calls, timers, mutations, settings, dispose, request,
+  const activity = (body, headers = {}, method = body === undefined ? 'GET' : 'POST') => activityHandler(new Request('http://localhost:7452/api/cpa-activity', {
+    method, headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json', ...headers},
+    ...(body === undefined ? {} : {body: JSON.stringify(body)})
+  }));
+  return {ctx, calls, timers, mutations, modelCalls, listeners, settings, dispose, request, activity, activityRaw: req => activityHandler(req),
     setRecord: value => { record = value; }, setFetcher: value => { upstream = value; }, advance: ms => { now += ms; },
     get removed() { return removed; },
     get: async () => { const response = await request(); assert.equal(response.status, 200); assert.equal(response.headers.get('cache-control'), 'no-store'); return response.json(); },
@@ -70,6 +91,240 @@ async function fixture(t, options = {}) {
     scheduled: () => [...timers.values()].find(x => x.delay === 3000).fn()
   };
 }
+
+const settleActivity = async () => { for (let n = 0; n < 40; n++) await Promise.resolve(); };
+const activityJson = async f => {
+  const response = await f.activity();
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  return response.json();
+};
+
+test('activity GET is memory-only and defaults to a disabled schedule', async t => {
+  const f = await fixture(t);
+  const state = await activityJson(f);
+  assert.equal(state.logs.summary.total, 0);
+  assert.equal(state.logs.limit, 200);
+  assert.deepEqual(state.logs.entries, []);
+  assert.equal(state.pelican.enabled, false);
+  assert.equal(state.pelican.running, false);
+  assert.equal(state.pelican.nextRunAt, null);
+  assert.equal(state.pelican.prompt, '生成一张鹈鹕骑自行车的SVG');
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.modelCalls.length, 0);
+  assert.equal(f.mutations.length, 0);
+});
+
+test('activity mutations enforce origin and request shape before any model work', async t => {
+  const f = await fixture(t);
+  let response = await f.activity({action: 'pelican-run', model: 'gpt-configured'}, {origin: 'https://attacker.invalid'});
+  assert.equal(response.status, 403);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal((await response.json()).error, 'cross-origin-write-denied');
+  response = await f.activity(undefined, {}, 'DELETE');
+  assert.equal(response.status, 405);
+  for (const body of [null, [], 'pelican-run', {action: 'not-an-action'}]) {
+    response = await f.activity(body);
+    assert.equal(response.status, 400);
+    assert.equal((await response.json()).error, 'invalid-action');
+  }
+  assert.equal(f.modelCalls.length, 0);
+  assert.equal(f.mutations.length, 0);
+});
+
+test('Fast cannot claim enabled or mutate unsupported host provider configuration', async t => {
+  const f = await fixture(t);
+  const state = await f.get();
+  assert.deepEqual(state.fast, {available: false, enabled: false, reason: 'host-fast-unsupported'});
+  const response = await f.request({action: 'fast', enabled: true});
+  assert.equal(response.status, 501);
+  assert.equal((await response.json()).error, 'host-fast-unsupported');
+  assert.equal(f.mutations.length, 0);
+  assert.equal(f.modelCalls.length, 0);
+});
+
+test('a manual pelican request is observed exactly once without a session or attachments', async t => {
+  const end = deferred();
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg"><circle r="1"/></svg>';
+  const f = await fixture(t, {stream: async function* () {
+    yield {type: 'text-delta', index: 0, text: svg};
+    await end.promise;
+    yield {type: 'usage', usage: {inputTokens: 100, cacheReadTokens: 50, cacheWriteTokens: 0, outputTokens: 10, totalTokens: 160}};
+    yield {type: 'finish', reason: {kind: 'stop'}};
+  }});
+  const response = await f.activity({action: 'pelican-run', model: 'gpt-configured'});
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).pelican.running, true);
+  await settleActivity();
+  assert.equal(f.modelCalls.length, 1);
+  const request = f.modelCalls[0];
+  assert.equal(request.provider, 'openai-codex');
+  assert.equal(request.model, 'gpt-configured');
+  assert.equal(request.sessionId, undefined);
+  assert.deepEqual(request.tools, []);
+  assert.equal(request.messages.length, 1);
+  assert.deepEqual(request.messages[0].content, [{type: 'text', text: '生成一张鹈鹕骑自行车的SVG'}]);
+  assert.equal(request.messages[0].source.kind, 'user');
+  f.advance(100);
+  end.resolve();
+  await settleActivity();
+  const state = await activityJson(f);
+  assert.equal(state.pelican.running, false);
+  assert.equal(state.pelican.lastResult.status, 'success');
+  assert.equal(state.pelican.lastResult.svg, svg);
+  assert.equal(state.logs.summary.total, 1);
+  assert.equal(state.logs.entries.length, 1);
+  const entry = state.logs.entries[0];
+  assert.equal(entry.source, 'pelican');
+  assert.equal(entry.status, 'success');
+  assert.equal(entry.httpStatus, null);
+  assert.equal(entry.inputTokens, 150);
+  assert.equal(entry.outputTokens, 10);
+  assert.equal(entry.cacheHitRate, 1 / 3);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.mutations.length, 0);
+});
+
+test('pelican schedule configuration is explicit, delayed, and unconditionally stoppable', async t => {
+  const f = await fixture(t);
+  let response = await f.activity({action: 'pelican-configure', enabled: true, model: 'gpt-configured', intervalMinutes: 1});
+  assert.equal(response.status, 200);
+  let state = await response.json();
+  assert.equal(state.pelican.enabled, true);
+  assert.equal(state.pelican.nextRunAt, new Date(NOW + 60000).toISOString());
+  assert.equal(f.modelCalls.length, 0);
+  response = await f.activity({action: 'pelican-configure', enabled: false, model: '', intervalMinutes: -1});
+  assert.equal(response.status, 200);
+  state = await response.json();
+  assert.equal(state.pelican.enabled, false);
+  assert.equal(state.pelican.nextRunAt, null);
+  assert.equal([...f.timers.values()].some(timer => timer.delay === 60000), false);
+  assert.equal(f.mutations.length, 0);
+});
+
+test('pelican busy, cancellation, and log clearing remain isolated from generation', async t => {
+  const gate = deferred();
+  const f = await fixture(t, {stream: async function* () {
+    await gate.promise;
+    yield {type: 'text-delta', index: 0, text: '<svg></svg>'};
+    yield {type: 'finish', reason: {kind: 'stop'}};
+  }});
+  assert.equal((await f.activity({action: 'pelican-run', model: 'gpt-configured'})).status, 200);
+  await settleActivity();
+  const busy = await f.activity({action: 'pelican-run', model: 'gpt-configured'});
+  assert.equal(busy.status, 409);
+  assert.equal((await busy.json()).error, 'pelican-busy');
+  assert.equal((await f.activity({action: 'logs-clear'})).status, 200);
+  assert.equal((await activityJson(f)).logs.summary.total, 0);
+  assert.equal((await f.activity({action: 'pelican-cancel'})).status, 200);
+  await settleActivity();
+  let state = await activityJson(f);
+  assert.equal(state.pelican.running, false);
+  assert.equal(state.pelican.lastResult.status, 'cancelled');
+  assert.equal(f.modelCalls[0].signal.aborted, true);
+  gate.resolve();
+  await settleActivity();
+  state = await activityJson(f);
+  assert.equal(state.logs.summary.total, 0);
+  assert.equal(state.pelican.lastResult.svg, null);
+});
+
+test('activity disposal aborts pending model validation and rejects later writes', async t => {
+  const catalog = deferred();
+  const f = await fixture(t, {listModels: () => catalog.promise});
+  const pending = f.activity({action: 'pelican-run', model: 'gpt-configured'});
+  await settleActivity();
+  f.dispose();
+  catalog.resolve([{id: 'gpt-configured'}]);
+  assert.equal((await pending).status, 503);
+  assert.equal((await f.activity()).status, 503);
+  assert.equal((await f.activity({action: 'pelican-configure', enabled: true, model: 'gpt-configured', intervalMinutes: 1})).status, 503);
+  assert.equal(f.modelCalls.length, 0);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.listeners.size, 0);
+  assert.equal(f.removed, 2);
+});
+
+test('activity errors do not expose arbitrary catalog or provider error text', async t => {
+  const f = await fixture(t, {listModels: async () => { throw Error('synthetic-private-access-token'); }});
+  const response = await f.activity({action: 'pelican-run', model: 'gpt-configured'});
+  assert.equal(response.status, 400);
+  const text = await response.text();
+  assert.equal(text.includes('synthetic-private-access-token'), false);
+  assert.equal(JSON.parse(text).error, 'pelican-models-unavailable');
+});
+
+test('activity disposal during body parsing rejects control work before it starts', async t => {
+  const f = await fixture(t), body = deferred();
+  const req = new Request('http://localhost:7452/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
+  req.json = () => body.promise;
+  const pending = f.activityRaw(req);
+  f.dispose();
+  body.resolve({action: 'pelican-run', model: 'gpt-configured'});
+  assert.equal((await pending).status, 503);
+  assert.equal(f.modelCalls.length, 0);
+  assert.equal(f.timers.size, 0);
+});
+
+test('cancel and disable supersede older control bodies that finish parsing late', async t => {
+  for (const [action, stop] of [['pelican-run', 'pelican-cancel'], ['pelican-configure', 'pelican-configure']]) {
+    await t.test(action, async t => {
+      const f = await fixture(t), body = deferred();
+      const req = new Request('http://localhost:7452/api/cpa-activity', {method: 'POST', headers: {host: 'localhost:7452', origin: 'http://localhost:7452', 'content-type': 'application/json'}, body: '{}'});
+      req.json = () => body.promise;
+      const pending = f.activityRaw(req);
+      const stopped = await f.activity({action: stop, enabled: false});
+      assert.equal(stopped.status, 200);
+      body.resolve({action, enabled: true, intervalMinutes: 1, model: 'gpt-configured'});
+      const late = await pending;
+      assert.equal(late.status, 400);
+      assert.equal((await late.json()).error, 'pelican-cancelled');
+      const state = await activityJson(f);
+      assert.equal(state.pelican.enabled, false);
+      assert.equal(state.pelican.running, false);
+      assert.equal(state.pelican.nextRunAt, null);
+      assert.equal(f.modelCalls.length, 0);
+    });
+  }
+});
+
+test('disable cancels a pending configure lookup and late catalogs cannot enable a plan', async t => {
+  const catalog = deferred();
+  const f = await fixture(t, {listModels: () => catalog.promise});
+  const pending = f.activity({action: 'pelican-configure', enabled: true, model: 'gpt-configured', intervalMinutes: 1});
+  await settleActivity();
+  assert.equal((await f.activity({action: 'pelican-configure', enabled: false})).status, 200);
+  const rejected = await pending;
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error, 'pelican-cancelled');
+  catalog.resolve([{id: 'gpt-configured'}]);
+  await settleActivity();
+  const state = await activityJson(f);
+  assert.equal(state.pelican.enabled, false);
+  assert.equal(state.pelican.nextRunAt, null);
+  assert.equal(f.modelCalls.length, 0);
+  assert.equal([...f.timers.values()].some(timer => timer.delay === 60000), false);
+});
+
+test('activity disposal aborts an active probe and discards late provider output', async t => {
+  const gate = deferred();
+  const f = await fixture(t, {stream: async function* () {
+    await gate.promise;
+    yield {type: 'text-delta', index: 0, text: '<svg>late</svg>'};
+    yield {type: 'finish', reason: {kind: 'stop'}};
+  }});
+  assert.equal((await f.activity({action: 'pelican-run', model: 'gpt-configured'})).status, 200);
+  await settleActivity();
+  f.dispose();
+  assert.equal(f.modelCalls[0].signal.aborted, true);
+  gate.resolve();
+  await settleActivity();
+  assert.equal((await f.activity()).status, 503);
+  assert.equal(f.modelCalls.length, 1);
+  assert.equal(f.timers.size, 0);
+  assert.equal(f.listeners.size, 0);
+  assert.equal(f.mutations.length, 0);
+});
 
 test('same-origin writes compare scheme, host and port and reject malformed origins', () => {
   const check = (url, host, origin, extra = {}) => sameOrigin(new Request(url, {headers: {host, 'content-type': 'application/json; charset=utf-8', ...(origin === undefined ? {} : {origin}), ...extra}}));
@@ -215,7 +470,7 @@ test('dispose aborts quota requests and removes routes and timers once', async t
   await started.promise;
   f.dispose(); f.dispose();
   assert.equal(f.calls[0].init.signal.aborted, true);
-  assert.equal(f.removed, 1);
+  assert.equal(f.removed, 2);
   assert.equal(f.timers.size, 0);
   gate.resolve();
   assert.equal((await request).status, 503);
@@ -354,7 +609,7 @@ test('disposal in the final state-await microtask cannot return a successful GET
     return null;
   };
   const response = await f.request();
-  assert.equal(f.removed, 1);
+  assert.equal(f.removed, 2);
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), {error: 'plugin-disposed'});
 });

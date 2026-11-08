@@ -1,17 +1,19 @@
 {
   "name": "dsh-cpa",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "type": "module",
   "license": "MIT",
-  "main": "./lib/index-v023.mjs",
+  "main": "./lib/index-v024.mjs",
   "exports": {
-    ".": "./lib/index-v023.mjs",
-    "./client": "./lib/client-v023.js"
+    ".": "./lib/index-v024.mjs",
+    "./client": "./lib/client-v024.js"
   },
   "files": [
     "lib",
     "cordis.patch.yml",
     "README.md",
+    "README.zh-CN.md",
+    "SECURITY.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md"
   ],
@@ -33,7 +35,7 @@
       "platform": "web"
     }
   },
-  "description": "In-process ChatGPT Codex authorization, model sync, and quota for DSH",
+  "description": "ChatGPT Codex authorization, quota, request metrics, USD estimates and in-memory SVG checks for DSH",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/M4rkzzz/dsh-cpa.git"
