@@ -666,3 +666,22 @@ test('throwing, asynchronous or merely truthy policy predicates fail closed with
     assert.equal(f.calls.length, 0);
   }
 });
+
+
+test('a recovered binding drops an invalidated remote catalog only for future calls', async t => {
+  const f = await fixture(t), remote = 'gpt-99-recovery';
+  await f.transport.setCatalog(A, [descriptor({id: remote})]);
+  const old = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  const current = f.state.get(A); current.controller.abort();
+  f.state.set(A, {...current, controller: new AbortController()});
+  await f.transport.refresh();
+  const models = await f.transport.listModels(A);
+  assert.ok(models.some(row => row.id === MODEL)); assert.ok(!models.some(row => row.id === remote));
+  const aborted = await collect(old.stream({...request(), ...old.config}));
+  assert.equal(aborted.at(-1).reason.kind, 'aborted'); assert.equal(f.calls.length, 0);
+  const fresh = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  assert.equal((await collect(fresh.stream({...request(), ...fresh.config}))).at(-1).reason.kind, 'stop');
+  await f.transport.setCatalog(A, [descriptor({id: remote})]);
+  assert.ok((await f.transport.listModels(A)).some(row => row.id === remote));
+  assert.equal((await collect(f.transport.stream(A, request({model: remote})))).at(-1).reason.kind, 'stop');
+});

@@ -218,6 +218,53 @@ test('delta/final block reconciliation avoids duplicated SVG and orders separate
   for (const secret of [SVG, PROMPT, 'PRIVATE-REASONING', '<svg', 'credentials']) assert.ok(!publicData.includes(secret));
 });
 
+test('SVG extraction preserves Markdown wrappers, self-closing and nested roots', async t => {
+  const roots = [SVG, '<svg/>', '<SVG xmlns="http://www.w3.org/2000/svg" / >',
+    '<svg><svg><path d="M0 0"/></svg></svg>', '<svg></svg \n>'];
+  const f = await fixture(t);
+  for (const svg of roots) {
+    f.behavior.stream = () => chunks([text('Here is the image:\n' + '```svg\n' + svg + '\n```\nDone.'), stop]);
+    await run(f); assert.equal(state(f).lastError, null); assert.equal(f.rendered.at(-1).svg, svg);
+  }
+  assert.equal(state(f).historyCount, roots.length);
+});
+
+test('repeated unfinished SVG tags remain bounded at the full output limit', async t => {
+  const f = await fixture(t);
+  // Compare increasing inputs, with a generous absolute allowance for busy CI.
+  // The implementation also has explicit O(n) structure: a fixed prefix search,
+  // one opening-end search and a forward-only closing-tag scan, never retries
+  // an unbounded suffix pattern at each candidate opening tag.
+  for (const unit of ['<svg ', '<svg >', '<svg></svg ']) {
+    const elapsed = [];
+    for (const budget of [16 * 1024, 256 * 1024]) {
+      const value = unit.repeat(Math.floor(budget / unit.length));
+      f.behavior.stream = () => chunks([text(value), stop]);
+      const start = performance.now(); await run(f); elapsed.push(performance.now() - start);
+      assert.equal(state(f).lastError, 'pelican-invalid-svg'); assert.equal(state(f).running, false);
+      assert.equal(f.rendered.length, 0); assert.equal(state(f).historyCount, 0);
+    }
+    assert.ok(elapsed[1] < 2000, 'full-budget malformed SVG must not stall the main thread: ' + elapsed);
+    assert.ok(elapsed[1] < elapsed[0] * 32 + 1000, 'growth must not resemble quadratic retries: ' + elapsed);
+    t.diagnostic(unit + ' small/full milliseconds: ' + elapsed.map(ms => ms.toFixed(3)).join('/'));
+  }
+});
+
+for (const phase of ['stream', 'render']) test('absolute deadline cannot be bypassed by synchronous ' + phase + ' without timer delivery', async t => {
+  const f = await fixture(t, {config: {timeoutMs: 25}});
+  if (phase === 'stream') f.behavior.stream = () => (async function* () {
+    yield text(SVG); f.clock.jump(25); yield stop;
+  })();
+  else f.behavior.render = () => {f.clock.jump(25); return PNG;};
+  await run(f);
+  assert.equal(state(f).lastError, 'pelican-timeout'); assert.equal(state(f).running, false);
+  assert.equal(state(f).historyCount, 0); assert.equal(f.rendered.length, phase === 'stream' ? 0 : 1);
+  assert.equal(f.calls[0].request.signal.aborted, true); assert.equal(f.clock.jobs.size, 0);
+  // A timed-out attempt must not poison account identity or the next run.
+  delete f.behavior.stream; delete f.behavior.render; await run(f);
+  assert.equal(state(f).lastError, null); assert.equal(state(f).historyCount, 1);
+});
+
 const failures = [
   ['stream exhausted', [], 'pelican-stream-closed'], ['max tokens', [text(SVG), {type: 'finish', reason: {kind: 'max-tokens'}}], 'pelican-max-tokens'],
   ['upstream failure', [{type: 'finish', reason: {kind: 'error', failure: {message: 'PRIVATE'}}}], 'pelican-generation-failed'],

@@ -68,7 +68,7 @@ async function fixture(t, options = {}) {
   const config = Config(raw), flows = new Map();
   const credentials = {
     async listRecords() {return [...records].map(([key, value]) => ({key, kind: value.kind}));},
-    async readRecord(key) {return records.has(key) ? structuredClone(records.get(key)) : undefined;},
+    async readRecord(key) {await options.beforeCredentialRead?.(key); return records.has(key) ? structuredClone(records.get(key)) : undefined;},
     modifyRecord(key, transform) {
       const previous = locks.get(key) ?? Promise.resolve();
       const task = previous.catch(() => {}).then(async () => {
@@ -724,4 +724,28 @@ test('inactive identity replacement cannot relabel a former account quota as fre
   const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A}});assert.ok((await f.get()).accounts.find(row=>row.id===A).quota);
   await f.send('/api/cpa-settings',{action:'account-select',accountId:B});f.records.set('cpa-codex/'+A,owned(A,'replacement-person'));
   const row=(await f.get()).accounts.find(row=>row.id===A);assert.equal(row.email,'replacement-person@example.test');assert.equal(row.quota,null);assert.equal(row.quotaStale,true);assert.equal(row.enabled,false);
+});
+
+
+test('temporary credential-store failure recovers through ordinary model listing and catalog sync without reload', async t => {
+  let unavailable = false, accounts;
+  const f = await fixture(t, {records: twoOwned(), preferences: {activeAccountId: A},
+    decorateAccounts: manager => {accounts = manager;},
+    beforeCredentialRead: () => {if (unavailable) throw Error('synthetic temporary credential read failure');}});
+  const sync = () => f.send('/api/cpa-settings', {action: 'sync', accountId: A});
+  assert.equal((await sync()).status, 200);
+  assert.ok((await f.llm.listModels(provider(A))).some(model => model.id === 'gpt-6-synthetic'));
+  const old = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  const bound = await accounts.capture(A, provider(A));
+  unavailable = true; await assert.rejects(bound.assertCurrent(), {code: 'accounts-unavailable'});
+  await tick(); unavailable = false;
+  assert.equal((await accounts.list()).find(row => row.id === A).availability, 'ready');
+  const recovered = await accounts.capture(A, provider(A)); await recovered.assertCurrent();
+  const models = await f.llm.listModels(provider(A));
+  assert.ok(models.some(model => model.id === MODEL)); assert.equal(models.some(model => model.id === 'gpt-6-synthetic'), false);
+  assert.equal((await consume(conversation(old))).at(-1).reason.kind, 'aborted'); assert.equal(f.modelCalls.length, 0);
+  assert.equal((await sync()).status, 200);
+  assert.ok((await f.llm.listModels(provider(A))).some(model => model.id === 'gpt-6-synthetic'));
+  const fresh = await f.llm.prepareCall({provider: provider(A), model: MODEL});
+  assert.equal((await consume(conversation(fresh))).at(-1).reason.kind, 'stop'); assert.equal(f.modelCalls.length, 1);
 });

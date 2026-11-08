@@ -361,6 +361,123 @@ test('export is lazy backpressured NDJSON, filtered and snapshot-stable without 
   assert.equal(ndjson.trim().split('\n').length, 5); assert.ok(ndjson.endsWith('\n'));
 });
 
+
+
+for (const stop of ['abort', 'cancel', 'clear', 'dispose']) {
+  test('export ' + stop + ' keeps a blocked scanner charged until its read exits', async t => {
+    const pause = gate(), readExited = Promise.withResolvers();
+    let reads = 0;
+    const f = await fixture(t, {maxReaders: 1, fs: instrument({async read(handle, args) {
+      reads++; await pause.wait();
+      try { return await handle.read(...args); }
+      finally { readExited.resolve(); }
+    }})});
+    t.after(() => pause.release());
+    await f.store.append(row(1)); pause.enable();
+    const abort = new AbortController(), reader = f.store.export({}, {signal: abort.signal}).getReader();
+    const pending = reader.read();
+    const result = stop === 'cancel' ? pending : assert.rejects(pending, errorCode('log-store-' +
+      (stop === 'abort' ? 'aborted' : stop === 'clear' ? 'cleared' : 'disposed')));
+    await pause.entered;
+    let stopping;
+    if (stop === 'abort') abort.abort();
+    else if (stop === 'cancel') stopping = reader.cancel();
+    else stopping = f.store[stop]();
+    await result;
+    if (stop !== 'dispose') {
+      for (let i = 0; i < 12; i++) {
+        assert.throws(() => f.store.export(), errorCode('log-store-busy'));
+        await assert.rejects(f.store.page(), errorCode('log-store-busy'));
+      }
+    }
+    assert.equal(reads, 1);
+    pause.release(); await readExited.promise; await stopping;
+    // Drain continuations of the completed real read, not a wall-clock delay.
+    await new Promise(resolve => setImmediate(resolve));
+    if (stop !== 'dispose') {
+      assert.equal((await f.store.page()).entries.length, stop === 'clear' ? 0 : 1);
+      await f.store.export().cancel();
+      assert.equal(f.store.snapshot().storage.available, true);
+    }
+  });
+}
+
+test('cancel stops a huge corrupt line after the in-flight block, with no further reads', async t => {
+  const f = await normalizedSeed(t);
+  await fs.writeFile(f.file, Buffer.concat([Buffer.alloc(4 * 1024 * 1024, 120), Buffer.from('\n')]));
+  const pause = gate();
+  let reads = 0, enabled = false;
+  const store = f.open({maxReaders: 1, blockSize: 4096, fs: instrument({async read(handle, args) {
+    if (enabled) reads++;
+    await pause.wait(); return handle.read(...args);
+  }})});
+  await store.ready;
+  t.after(() => pause.release());
+  enabled = true; pause.enable();
+  const reader = store.export().getReader(), pending = reader.read();
+  await pause.entered;
+  const cancelling = reader.cancel(new Error('PRIVATE-CANCEL-REASON'));
+  assert.deepEqual(await pending, {value: undefined, done: true});
+  await assert.rejects(store.page(), errorCode('log-store-busy'));
+  pause.release(); await cancelling;
+  assert.equal(reads, 1, 'cancel must not scan the remaining 4MiB invalid line');
+  assert.equal(store.snapshot().storage.available, true);
+  await store.export().cancel(); // Quota was returned only after scanner exit.
+});
+
+test('cancel before scanner creation releases quota and never starts a late scanner', async t => {
+  for (const stage of ['barrier', 'verify']) {
+    const pause = gate();
+    let reads = 0;
+    const io = instrument({async write(handle, args) {
+      if (stage === 'barrier') await pause.wait();
+      return handle.write(...args);
+    }, async read(handle, args) { reads++; return handle.read(...args); }});
+    const originalLstat = io.lstat;
+    io.lstat = async (...args) => {
+      if (stage === 'verify') await pause.wait();
+      return originalLstat(...args);
+    };
+    const f = await fixture(t, {maxReaders: 1, fs: io});
+    t.after(() => pause.release());
+    await f.store.append(row(1)); pause.enable();
+    const writing = stage === 'barrier' ? f.store.append(row(2)) : undefined;
+    const reader = f.store.export().getReader(), pending = reader.read();
+    await pause.entered;
+    await reader.cancel();
+    assert.deepEqual(await pending, {value: undefined, done: true});
+    await f.store.export().cancel(); // Still-hung pre-scan work owns no buffers.
+    pause.release(); await writing;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reads, 0, stage + ' must not resume a cancelled scanner');
+    assert.equal((await f.store.page()).entries.length, stage === 'barrier' ? 2 : 1);
+  }
+});
+
+test('export scanner and verification errors return the reader quota', async t => {
+  let failRead = false, failVerify = false;
+  const io = instrument({async read(handle, args) {
+    if (failRead) throw new Error('PRIVATE-READ-FAILURE');
+    return handle.read(...args);
+  }});
+  const originalLstat = io.lstat;
+  io.lstat = async (...args) => {
+    if (failVerify) throw new Error('PRIVATE-VERIFY-FAILURE');
+    return originalLstat(...args);
+  };
+  const f = await fixture(t, {maxReaders: 1, fs: io});
+  await f.store.append(row(1));
+  for (const stage of ['read', 'verify']) {
+    failRead = stage === 'read'; failVerify = stage === 'verify';
+    await assert.rejects(collect(f.store.export()), errorCode('log-storage-unavailable'));
+    await new Promise(resolve => setImmediate(resolve));
+    failRead = false; failVerify = false;
+    await f.store.clear(); await f.store.append(row(1));
+    assert.equal((await collect(f.store.export())).length, 1);
+    assert.equal((await f.store.page()).entries.length, 1);
+  }
+});
+
 test('idle exports and pending reads abort safely, without retaining reader slots', async t => {
   const f = await fixture(t, {maxReaders: 1}); await f.store.append(row(1));
   const abort = new AbortController(), stream = f.store.export({}, {signal: abort.signal}), reader = stream.getReader();

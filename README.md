@@ -4,6 +4,14 @@ Isolated ChatGPT Codex accounts, quota, real Fast, persistent request metadata a
 
 Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. The GitHub channel detects version bumps on the default branch without requiring a GitHub Release.
 
+## 0.2.7
+
+- Extract untrusted SVG text in linear time, with an absolute deadline covering synchronous processing.
+- Cancel the underlying log scan and retain its reader quota until it actually exits.
+- Recover from temporary credential-store failures by dropping invalidated remote catalogs for new calls; old prepared calls stay invalid.
+- Revalidate activation model choices against the acknowledged catalog without overwriting newer session/model choices.
+- Keep every retired backend entry and shipped client asset.
+
 ## 0.2.6
 
 - The composer toolbar contains **Fast / weekly quota**, matched to the adjacent model control's font, line-height and height.

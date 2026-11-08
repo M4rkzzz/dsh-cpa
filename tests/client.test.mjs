@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v026.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v027.js',import.meta.url),'utf8');
 const MODEL='synthetic-model', A='a', B='b', email=id=>id+'@example.test', provider=id=>'cpa-codex-'+id;
 const account=(id=A,extra={})=>({id,provider:provider(id),email:email(id),owned:id!==A,enabled:id===A,
  availability:'ready',canRunProbe:id===A,models:[MODEL,'other-model'],quota:{windows:[
@@ -302,4 +302,28 @@ test('removing the displayed account closes its history and ignores its late PNG
  ui.click(ui.byLabel('移除 '+email(B)));await ui.flush();await ui.respond('account-remove',settings({accounts:[account(A)]}));
  history.respond({images:[{id:'b-png',url:'/api/cpa-image?accountId=b&imageId=b-png',createdAt:'2026-11-08T01:00:00Z'}]});await ui.flush();
  assert.equal(ui.all(n=>n.type==='img').length,0);assert.equal(ui.all(n=>n.props.role==='dialog').length,0);ui.unmount();
+});
+
+
+const enabledB = models => settings({accounts:[account(A,{enabled:false,canRunProbe:false}),account(B,{enabled:true,canRunProbe:true,models})],
+ preferences:{activeAccountId:B,plans:{}},fast:{available:true,enabled:false,providers:[provider(B)]}});
+for(const directoryUpdated of [false,true])test('activation ACK refreshes newly supported current model even when the directory update is late: '+directoryUpdated,async()=>{
+ const fresh='gpt-6-recovery',old='gpt-5-old',groups=[{id:'openai-codex',models:[{id:fresh}]},{id:provider(B),models:[{id:old}]}];
+ const ui=await harness({currentModel:fresh,groups}).ready(settings({accounts:[account(A),account(B,{models:[old]})]}));
+ ui.change(ui.byLabel('启用 '+email(B)),B);await ui.flush();
+ if(directoryUpdated)ui.setDirectory({groups:[...groups.slice(0,1),{id:provider(B),models:[{id:old},{id:fresh}]}]});
+ await ui.respond('account-select',enabledB([old,fresh]));
+ assert.deepEqual(ui.selected,[{provider:provider(B),model:fresh}]);assert.equal(ui.text().includes('请选择该账号支持的模型'),false);ui.unmount();
+});
+test('activation chooser uses ACK models and omits withdrawn stale catalog entries',async()=>{
+ const ui=await harness({currentModel:'unsupported-model'}).ready();ui.change(ui.byLabel('启用 '+email(B)),B);await ui.flush();
+ await ui.respond('account-select',enabledB(['gpt-6-new']));const chooser=ui.byLabel(email(B)+' 的会话模型');
+ assert.deepEqual(ui.all(n=>n.type==='option',chooser).map(n=>n.props.value),['','gpt-6-new']);assert.equal(ui.selected.length,0);ui.unmount();
+});
+for(const change of ['session','model'])test('unsupported pre-ACK model still preserves a newer '+change+' choice on refresh',async()=>{
+ const ui=await harness({currentModel:'gpt-6-recovery',groups:[{id:provider(B),models:[{id:MODEL}]}]}).ready();
+ ui.change(ui.byLabel('启用 '+email(B)),B);await ui.flush();
+ if(change==='session')ui.setSession('session-new');else ui.setDirectory({current:{provider:'other',model:'new-explicit-model'}});
+ await ui.respond('account-select',enabledB([MODEL,'gpt-6-recovery']));
+ assert.equal(ui.selected.length,0);assert.match(ui.text(),change==='session'?/会话已切换/:/模型已由其它操作更改/);ui.unmount();
 });
