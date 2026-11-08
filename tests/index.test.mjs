@@ -749,3 +749,25 @@ test('temporary credential-store failure recovers through ordinary model listing
   const fresh = await f.llm.prepareCall({provider: provider(A), model: MODEL});
   assert.equal((await consume(conversation(fresh))).at(-1).reason.kind, 'stop'); assert.equal(f.modelCalls.length, 1);
 });
+
+
+test('default runtime clock persists real TTFT duration and TPS after a bundled SDK stream', async t=>{
+  const f=await fixture(t,{records:twoOwned(),preferences:{activeAccountId:A},modelFetch:async()=>{
+    const original=modelResponse(),text=await original.text(),frames=text.split('\n\n').filter(Boolean);let index=0;
+    return new Response(new ReadableStream({async pull(controller){
+      if(index>=frames.length){controller.close();return;}
+      await new Promise(resolve=>setTimeout(resolve,8));controller.enqueue(new TextEncoder().encode(frames[index++]+'\n\n'));
+    }}),{status:200,headers:{'content-type':'text/event-stream'}});
+  }});
+  const prepared=await f.llm.prepareCall({provider:provider(A),model:MODEL});
+  assert.equal((await consume(conversation(prepared))).at(-1).reason.kind,'stop');
+  const activity=await f.activity(),row=activity.logs.entries[0];
+  assert.equal(row.source,'conversation');assert.equal(row.usageEvidence,'provider');assert.equal(row.outputTokens,20);
+  assert.ok(Number.isFinite(row.ttftMs)&&row.ttftMs>=0,'default-clock TTFT is measured');
+  assert.ok(Number.isFinite(row.durationMs)&&row.durationMs>row.ttftMs,'default-clock total duration is measured');
+  assert.ok(Number.isFinite(row.tps)&&row.tps>0,'real output and elapsed generation produce TPS');
+  assert.ok(Math.abs(row.tps-20/((row.durationMs-row.ttftMs)/1000))<0.000001);
+  assert.equal(activity.logs.summary.samples.ttft,1);assert.equal(activity.logs.summary.samples.tps,1);
+  const stored=JSON.parse((await readFile(join(f.directory,'.dsh-cpa','activity.ndjson'),'utf8')).trim());
+  assert.equal(stored.ttftMs,row.ttftMs);assert.equal(stored.durationMs,row.durationMs);assert.equal(stored.tps,row.tps);
+});

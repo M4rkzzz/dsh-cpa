@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 import vm from 'node:vm';
 
-const source=readFileSync(new URL('../lib/client-v028.js',import.meta.url),'utf8');
+const source=readFileSync(new URL('../lib/client-v029.js',import.meta.url),'utf8');
 const MODEL='synthetic-model', A='a', B='b', email=id=>id+'@example.test', provider=id=>'cpa-codex-'+id;
 const account=(id=A,extra={})=>({id,provider:provider(id),email:email(id),owned:id!==A,enabled:id===A,
  availability:'ready',canRunProbe:id===A,models:[MODEL,'other-model'],quota:{windows:[
@@ -37,7 +37,7 @@ class BrowserDate extends Date {
  toLocaleString(){return this.toISOString().replace('T',' ').replace('.000Z','');}
 }
 function harness({pill=false,visibility='visible',currentProvider='openai-codex',currentModel=MODEL,currentSession='session-a',locked=false,confirm=true,load,select,groups,initialSettings}={}){
- const hooks=[],effects=[],timers=new Map(),listeners=new Map(),requests=[],opened=[],removed=[],registered=[],selected=[],loads=[],confirms=[],subscribers=new Set();
+ const hooks=[],effects=[],timers=new Map(),listeners=new Map(),requests=[],opened=[],removed=[],registered=[],selected=[],loads=[],confirms=[],styles=[],subscribers=new Set();
  let cursor=0,dirty=false,mounted=true,tree,component,props={},factory,now=0,timerId=0,afterUnmount=0,focused=0,binding={key:currentSession};
  let state={current:{provider:currentProvider,model:currentModel,reasoningEffort:'high'},status:'ready',pending:null,groups:groups??[
   {id:'openai-codex',name:'Host',models:[{id:MODEL}]},
@@ -52,7 +52,7 @@ function harness({pill=false,visibility='visible',currentProvider='openai-codex'
  };
  const store={getSnapshot:()=>state,subscribe:fn=>{subscribers.add(fn);return()=>subscribers.delete(fn);}};
  const directory={store,async load(){loads.push(binding.key);return load?load(state):state;},async select(value){selected.push({...value});const result=select?await select(value):{ok:true};if(result?.ok){state={...state,current:{...value}};for(const notify of subscribers)notify();}return result;}};
- const document={visibilityState:visibility,querySelector:()=>true,
+ const document={visibilityState:visibility,querySelector:selector=>selector.includes('fast-switch-v029')?styles.find(style=>selector.includes(style.dataset.pluginCss)):true,createElement:()=>({dataset:{},textContent:''}),head:{appendChild:style=>styles.push(style)},
   addEventListener(name,fn){if(!listeners.has(name))listeners.set(name,new Set());listeners.get(name).add(fn);},removeEventListener(name,fn){listeners.get(name)?.delete(fn);}};
  const context={window:{__ModuleLoader__:{load:value=>factory=value.factory},open:(...args)=>opened.push(args),focus:()=>focused++,confirm:message=>{confirms.push(message);return confirm;}},document,console,URL,URLSearchParams,Date:BrowserDate,
   setInterval(fn,ms){const id=++timerId;timers.set(id,{fn,ms,next:now+ms});return id;},clearInterval:id=>timers.delete(id),
@@ -79,10 +79,10 @@ function harness({pill=false,visibility='visible',currentProvider='openai-codex'
  function all(predicate,node=tree){node=expand(node);if(node==null||typeof node==='boolean')return [];if(Array.isArray(node))return node.flatMap(item=>all(predicate,item));if(typeof node!=='object')return [];return [...(predicate(node)?[node]:[]),...node.children.flatMap(item=>all(predicate,item))];}
  function one(predicate){const nodes=all(predicate);assert.equal(nodes.length,1,'expected one node, got '+nodes.length);return nodes[0];}
  render();
- const api={requests,opened,removed,registered,selected,loads,confirms,timers,listeners,ctx,props,
+ const api={requests,opened,removed,registered,selected,loads,confirms,styles,timers,listeners,ctx,props,
   get tree(){return tree;},get afterUnmount(){return afterUnmount;},get focused(){return focused;},get directory(){return state;},
-  text,all,one,byLabel:label=>one(node=>node.props['aria-label']===label),button:label=>one(node=>['Button','button'].includes(node.type)&&text(node)===label),
-  click(node){assert.ok(!node.props.disabled,'control is disabled');node.props.onClick?.({preventDefault(){},currentTarget:{focus:()=>focused++}});render();},
+  text,all,one,fast:()=>one(node=>node.type==='input'&&node.props.role==='switch'&&node.props['aria-label']==='Fast'),byLabel:label=>one(node=>node.props['aria-label']===label),button:label=>one(node=>['Button','button'].includes(node.type)&&text(node)===label),
+  click(node){assert.ok(!node.props.disabled,'control is disabled');if(node.type==='input'&&node.props.type==='checkbox'){const target={checked:!node.props.checked};node.props.onChange({target,currentTarget:target});}else node.props.onClick?.({preventDefault(){},currentTarget:{focus:()=>focused++}});render();},
   change(node,value){assert.ok(!node.props.disabled,'control is disabled');node.props.onChange({target:{value}});render();},
   pending:(action,accountId)=>requests.find(request=>request.pending&&request.action===action&&(accountId===undefined||request.body?.accountId===accountId)),
   async flush(){for(let i=0;i<35;i++){await Promise.resolve();if(dirty)render();}},
@@ -97,15 +97,15 @@ function harness({pill=false,visibility='visible',currentProvider='openai-codex'
  return api;
 }
 
-test('v026 registers real public selection services and removes only its two entries',()=>{
+test('v029 registers real public selection services and removes only its two entries',()=>{
  const ui=harness({pill:true});assert.deepEqual(ui.registered.map(row=>row.config.name),['settings.section','conversation.input.right']);
  assert.equal(ui.tree.props.style.height,28);ui.unmount();assert.deepEqual(ui.removed,['cpa-settings','cpa-usage']);assert.equal(ui.afterUnmount,0);
  const other=harness({pill:true,currentProvider:'other-provider'});assert.equal(other.tree,null);assert.equal(other.requests.length,0);other.unmount();
 });
-test('toolbar has only Fast and weekly quota with model-matched dimensions and no CPA trigger',async()=>{
- const ui=await harness({pill:true}).ready();const buttons=ui.all(n=>n.type==='button');assert.equal(buttons.length,2);assert.deepEqual(buttons.map(n=>ui.text(n)),['Fast','周 23%']);
- for(const button of buttons){assert.equal(button.props.style.height,28);assert.equal(button.props.style.fontSize,13);assert.equal(button.props.style.fontWeight,400);assert.equal(button.props.style.lineHeight,'20px');assert.equal(button.props.style.padding,'0 6px');}
- assert.equal(ui.all(n=>n.props['aria-haspopup']==='dialog').length,1);assert.equal(ui.button('Fast').props['aria-checked'],false);ui.unmount();
+test('toolbar has a Fast switch and weekly quota with model-matched dimensions and no CPA trigger',async()=>{
+ const ui=await harness({pill:true}).ready();const buttons=ui.all(n=>n.type==='button'),label=ui.one(n=>n.type==='label'&&n.props.className==='cpaFast_switch');assert.equal(buttons.length,1);assert.deepEqual(buttons.map(n=>ui.text(n)),['周 23%']);assert.equal(ui.text(label),'Fast');assert.equal(ui.fast().props.type,'checkbox');
+ for(const control of [label,...buttons]){assert.equal(control.props.style.height,28);assert.equal(control.props.style.fontSize,13);assert.equal(control.props.style.fontWeight,400);assert.equal(control.props.style.lineHeight,'20px');assert.equal(control.props.style.padding,'0 6px');}
+ assert.equal(ui.all(n=>n.props['aria-haspopup']==='dialog').length,1);assert.equal(ui.fast().props['aria-checked'],false);ui.unmount();
 });
 test('account list is email-named and has one enabled radio; only the active test is usable',async()=>{
  const ui=await harness().ready();assert.equal(ui.all(n=>n.type==='article').length,2);const radios=ui.all(n=>n.type==='input'&&n.props.type==='radio');
@@ -124,12 +124,12 @@ test('the words pelican test run exactly once and do not enable a schedule',asyn
  assert.equal(ui.pending('pelican-configure'),undefined);request.respond(withPelican(A,{running:true}));await ui.flush();assert.equal(ui.byLabel(email(A)+' 停止').props.disabled,false);ui.unmount();
 });
 test('Fast activation uses normal public model selection and ACK, never an optimistic checkbox',async()=>{
- const ui=await harness({pill:true}).ready();ui.click(ui.button('Fast'));await ui.flush();assert.equal(ui.button('Fast').props['aria-checked'],false);
+ const ui=await harness({pill:true}).ready();ui.click(ui.fast());await ui.flush();assert.equal(ui.fast().props['aria-checked'],false);
  assert.equal(ui.pending('fast').body.enabled,true);assert.equal(ui.pending('fast').body.accountId,A);assert.equal(ui.selected.length,0);
  await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));
  assert.deepEqual(ui.selected,[{provider:provider(A),model:MODEL,reasoningEffort:'high'}]);
  if(ui.pending('get'))await ui.respond('get',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));
- assert.equal(ui.button('Fast').props['aria-checked'],true);assert.equal(ui.button('Fast').props.disabled,false);ui.unmount();
+ assert.equal(ui.fast().props['aria-checked'],true);assert.equal(ui.fast().props.disabled,false);ui.unmount();
 });
 test('no-session account activation persists the one selected account without inventing a session',async()=>{
  const ui=await harness({currentSession:undefined}).ready();ui.setSession(undefined);ui.change(ui.byLabel('启用 '+email(B)),true);await ui.flush();
@@ -140,25 +140,25 @@ test('no-session account activation persists the one selected account without in
 
 test('Fast off stays on the same owned channel and omits selection RPCs',async()=>{
  const ui=await harness({pill:true,currentProvider:provider(A)}).ready(settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));
- assert.equal(ui.button('Fast').props['aria-checked'],true);ui.click(ui.button('Fast'));await ui.flush();assert.equal(ui.pending('fast').body.enabled,false);
- await ui.respond('fast',settings());assert.equal(ui.button('Fast').props['aria-checked'],false);assert.equal(ui.selected.length,0);ui.unmount();
+ assert.equal(ui.fast().props['aria-checked'],true);ui.click(ui.fast());await ui.flush();assert.equal(ui.pending('fast').body.enabled,false);
+ await ui.respond('fast',settings());assert.equal(ui.fast().props['aria-checked'],false);assert.equal(ui.selected.length,0);ui.unmount();
 });
 for(const mode of ['inactive','missing-capability','locked','unavailable-credentials'])test('Fast fails closed for '+mode,async()=>{
  const rows=mode==='inactive'?[account(A,{enabled:false}),account(B,{enabled:true})]:mode==='unavailable-credentials'?[account(A,{availability:'unknown'}),account(B)]:undefined;
  const data=settings({...rows?{accounts:rows}:{},...mode==='missing-capability'?{fast:{available:false,enabled:true,providers:[]}}:{}});
- const ui=await harness({pill:true,locked:mode==='locked'}).ready(data);assert.equal(ui.button('Fast').props.disabled,true);assert.equal(ui.button('Fast').props['aria-checked'],false);assert.equal(ui.pending('fast'),undefined);ui.unmount();
+ const ui=await harness({pill:true,currentProvider:mode==='inactive'?provider(A):'openai-codex',locked:mode==='locked'}).ready(data);assert.equal(ui.fast().props['aria-disabled'],true);assert.equal(ui.fast().props.disabled,false);assert.equal(ui.fast().props.checked,false);ui.click(ui.fast());await ui.flush();assert.ok(ui.all(n=>n.props.role==='alert').length);assert.equal(ui.pending('fast'),undefined);ui.unmount();
 });
 test('Fast failure never selects a model or fakes an enabled check, and remains retryable',async()=>{
- const ui=await harness({pill:true}).ready();ui.click(ui.button('Fast'));await ui.flush();await ui.respond('fast',{error:'settings-save-failed'},false);
- assert.equal(ui.selected.length,0);assert.equal(ui.button('Fast').props['aria-checked'],false);assert.equal(ui.button('Fast').props.disabled,false);assert.match(ui.text(),/设置未能保存/);ui.unmount();
+ const ui=await harness({pill:true}).ready();ui.click(ui.fast());await ui.flush();await ui.respond('fast',{error:'settings-save-failed'},false);
+ assert.equal(ui.selected.length,0);assert.equal(ui.fast().props['aria-checked'],false);assert.equal(ui.fast().props.disabled,false);assert.match(ui.text(),/设置未能保存/);ui.unmount();
 });
 test('resolved public select failure is not success and raw RPC errors are never shown',async()=>{
- const ui=await harness({pill:true,select:()=>({ok:false,error:{code:'other',message:'synthetic private error'}})}).ready();ui.click(ui.button('Fast'));await ui.flush();
- await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));assert.equal(ui.button('Fast').props['aria-checked'],false);
+ const ui=await harness({pill:true,select:()=>({ok:false,error:{code:'other',message:'synthetic private error'}})}).ready();ui.click(ui.fast());await ui.flush();
+ await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));assert.equal(ui.fast().props['aria-checked'],false);
  assert.match(ui.text(),/模型选择失败/);assert.equal(ui.text().includes('synthetic private'),false);ui.unmount();
 });
 test('unsupported current model cannot silently pick a different paid model when enabling Fast',async()=>{
- const ui=await harness({pill:true,currentModel:'unsupported-model'}).ready();ui.click(ui.button('Fast'));await ui.flush();assert.equal(ui.pending('fast'),undefined);assert.equal(ui.selected.length,0);assert.match(ui.text(),/不受此 CPA 通道支持/);ui.unmount();
+ const ui=await harness({pill:true,currentModel:'unsupported-model'}).ready();ui.click(ui.fast());await ui.flush();assert.equal(ui.pending('fast'),undefined);assert.equal(ui.selected.length,0);assert.match(ui.text(),/不受此 CPA 通道支持/);ui.unmount();
 });
 test('quota popover does not toggle Fast and Escape restores focus',async()=>{
  const ui=await harness({pill:true}).ready();const button=ui.byLabel('查看周额度');ui.click(button);assert.equal(ui.all(n=>n.props.role==='dialog').length,1);assert.equal(ui.pending('fast'),undefined);
@@ -287,9 +287,9 @@ test('unmount invalidates pending settings, actions, history and polls without p
 
 
 test('a Fast ACK for a different enabled account cannot select the old inactive provider',async()=>{
- const ui=await harness({pill:true}).ready();ui.click(ui.button('Fast'));await ui.flush();
+ const ui=await harness({pill:true}).ready();ui.click(ui.fast());await ui.flush();
  await ui.respond('fast',settings({accounts:[account(A,{enabled:false,canRunProbe:false}),account(B,{enabled:true,canRunProbe:true})],preferences:{activeAccountId:B,plans:{}},fast:{available:true,enabled:true,providers:[provider(B)]}}));
- assert.equal(ui.selected.length,0);assert.equal(ui.button('Fast').props['aria-checked'],false);assert.match(ui.text(),/账号已更改，未切换当前会话模型/);ui.unmount();
+ assert.equal(ui.selected.length,0);assert.equal(ui.fast().props['aria-checked'],false);assert.match(ui.text(),/账号已更改，未切换当前会话模型/);ui.unmount();
 });
 test('removing an unrelated account does not invalidate an in-flight retained-account PNG history',async()=>{
  const ui=await harness().ready();ui.click(ui.byLabel(email(A)+' 的历史'));await ui.flush();const history=ui.pending('history-get');
@@ -326,4 +326,69 @@ for(const change of ['session','model'])test('unsupported pre-ACK model still pr
  if(change==='session')ui.setSession('session-new');else ui.setDirectory({current:{provider:'other',model:'new-explicit-model'}});
  await ui.respond('account-select',enabledB([MODEL,'gpt-6-recovery']));
  assert.equal(ui.selected.length,0);assert.match(ui.text(),change==='session'?/会话已切换/:/模型已由其它操作更改/);ui.unmount();
+});
+
+
+test('Fast is a native keyboard-operable switch with a real thumb, not a button with a switch role',async()=>{
+ const ui=await harness({pill:true}).ready(),input=ui.fast(),label=ui.one(n=>n.type==='label'&&n.props.className==='cpaFast_switch');
+ assert.equal(input.props.type,'checkbox');assert.equal(typeof input.props.onChange,'function');assert.equal(input.props.onClick,undefined);
+ assert.equal(ui.all(n=>n.type==='button'&&ui.text(n)==='Fast').length,0);assert.equal(ui.all(n=>n.props.className==='cpaFast_thumb',label).length,1);
+ const target={checked:true};input.props.onChange({target,currentTarget:target});assert.equal(target.checked,false);await ui.flush();
+ assert.equal(ui.fast().props.checked,false);assert.equal(ui.fast().props.disabled,true);assert.equal(ui.fast().props['aria-busy'],true);assert.match(ui.text(),/保存中/);
+ await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));
+ assert.equal(ui.fast().props.checked,true);assert.equal(ui.fast().props.disabled,false);assert.equal(ui.fast().props['aria-busy'],false);ui.unmount();
+});
+test('native Codex Fast targets the acknowledged enabled owned account, not the inactive quota reference',async()=>{
+ const state=enabledB([MODEL,'other-model']),ui=await harness({pill:true}).ready(state);
+ assert.equal(ui.fast().props['aria-disabled'],false);ui.click(ui.fast());await ui.flush();assert.equal(ui.pending('fast').body.accountId,B);
+ await ui.respond('fast',{...state,fast:{available:true,enabled:true,providers:[provider(B)]}});
+ assert.deepEqual(ui.selected,[{provider:provider(B),model:MODEL,reasoningEffort:'high'}]);assert.equal(ui.fast().props.checked,true);ui.unmount();
+});
+test('Fast ACK remains checked after model routing even when an older quota poll never resolves',async()=>{
+ const ui=await harness({pill:true}).ready();ui.advance(60000);await ui.flush();const old=ui.pending('get');assert.ok(old);
+ ui.click(ui.fast());await ui.flush();await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));
+ assert.equal(ui.fast().props.checked,true);assert.equal(ui.fast().props.disabled,false);ui.advance(600000);await ui.flush();
+ assert.equal(ui.fast().props.checked,true);assert.equal(ui.fast().props.disabled,false);old.respond(settings());await ui.flush();assert.equal(ui.fast().props.checked,true);ui.unmount();
+});
+test('Fast can retain the same newly advertised model when the shared directory catalog is stale',async()=>{
+ const fresh='gpt-new',ui=await harness({pill:true,currentModel:fresh,groups:[{id:'openai-codex',models:[{id:fresh}]},{id:provider(A),models:[{id:MODEL}]}]}).ready(settings({accounts:[account(A,{models:[MODEL,fresh]})]}));
+ ui.click(ui.fast());await ui.flush();assert.ok(ui.pending('fast'));await ui.respond('fast',settings({accounts:[account(A,{models:[MODEL,fresh]})],fast:{available:true,enabled:true,providers:[provider(A)]}}));
+ assert.deepEqual(ui.selected,[{provider:provider(A),model:fresh}]);assert.equal(ui.fast().props.checked,true);ui.unmount();
+});
+test('pressing Fast while unavailable reports why without a paid request or a fake checked state',async()=>{
+ const ui=await harness({pill:true}).ready(settings({accounts:[account(A,{enabled:false})],preferences:{activeAccountId:'',plans:{}},fast:{available:false,enabled:false,providers:[],reason:'cpa-account-unavailable'}}));
+ ui.click(ui.fast());await ui.flush();assert.match(ui.text(),/启用一个可用账号/);assert.equal(ui.fast().props.checked,false);assert.equal(ui.pending('fast'),undefined);assert.equal(ui.selected.length,0);ui.unmount();
+});
+test('Fast state-load failure is visible and the same switch starts an explicit read retry',async()=>{
+ const ui=harness({pill:true});ui.pending('get').fail();await ui.flush();ui.click(ui.fast());await ui.flush();assert.match(ui.text(),/状态读取失败/);assert.ok(ui.pending('get'));
+ await ui.respond('get',settings());ui.click(ui.fast());await ui.flush();assert.ok(ui.pending('fast'));ui.unmount();
+});
+for(const change of ['model','provider'])test('a pending Fast ACK cannot overwrite a newer '+change+' selection',async()=>{
+ const ui=await harness({pill:true}).ready();ui.click(ui.fast());await ui.flush();ui.setDirectory({current:{provider:change==='provider'?provider(B):'openai-codex',model:change==='model'?'different-model':MODEL}});
+ await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));assert.equal(ui.selected.length,0);assert.equal(ui.fast().props.disabled,false);ui.unmount();
+});
+test('service tier label explains priority/default separately from max reasoning effort',async()=>{
+ const ui=await harness().ready(settings(),withLogs({entries:[logRow()]}));assert.match(ui.text(),/服务等级：请求 \/ 返回/);assert.match(ui.text(),/max 等推理强度/);assert.match(ui.text(),/priority \/ default 表示请求加速/);ui.unmount();
+});
+
+
+test('Fast rechecks ACK models and never selects a model withdrawn while saving',async()=>{
+ const ui=await harness({pill:true}).ready();ui.click(ui.fast());await ui.flush();
+ await ui.respond('fast',settings({accounts:[account(A,{models:['other-model']})],fast:{available:true,enabled:true,providers:[provider(A)]}}));
+ assert.equal(ui.selected.length,0);assert.equal(ui.fast().props.checked,false);assert.match(ui.text(),/当前模型已不受/);ui.unmount();
+});
+
+
+test('Fast preserves advertised max reasoning while toggling a separate service-tier preference',async()=>{
+ const ui=await harness({pill:true,currentProvider:provider(A),currentModel:MODEL}).ready();
+ ui.setDirectory({current:{provider:provider(A),model:MODEL,reasoningEffort:'max'},groups:[{id:provider(A),models:[{id:MODEL,reasoning:{efforts:[{id:'max'}],defaultEffort:'max'}}]}]});
+ ui.click(ui.fast());await ui.flush();await ui.respond('fast',settings({fast:{available:true,enabled:true,providers:[provider(A)]}}));
+ assert.equal(ui.directory.current.reasoningEffort,'max');assert.equal(ui.selected.length,0);assert.equal(ui.fast().props.checked,true);
+ ui.click(ui.fast());await ui.flush();await ui.respond('fast',settings());assert.equal(ui.directory.current.reasoningEffort,'max');assert.equal(ui.selected.length,0);assert.equal(ui.fast().props.checked,false);ui.unmount();
+});
+
+
+test('Fast switch installs its own checked, focus and pending styles instead of inheriting button-only styling',()=>{
+ const ui=harness({pill:true});assert.equal(ui.styles.length,1);const css=ui.styles[0].textContent;
+ assert.match(css,/\.cpaFast_input:checked\+\.cpaFast_track/);assert.match(css,/\.cpaFast_input:focus-visible/);assert.match(css,/data-busy=true/);assert.match(css,/prefers-reduced-motion/);ui.unmount();
 });

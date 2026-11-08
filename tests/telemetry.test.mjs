@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {getEventListeners} from 'node:events';
+import * as zlib from 'node:zlib';
+import {Context} from '@deepseek-ai/cordis';
+import LlmRuntime from '@deepseek-ai/dsh-llm';
+import {createCpaTransport} from '../lib/transport-v026.mjs';
 import {createTelemetry} from '../lib/telemetry-v026.mjs';
 import {createTelemetry as createLegacyTelemetry} from '../lib/telemetry-v024.mjs';
 import {createEvidence, attachEvidence} from '../lib/evidence-v026.mjs';
@@ -91,6 +95,9 @@ test('complete prompt input, token TTFT, elapsed time and TPS use observed value
 });
 
 for (const first of [text('x'), {type: 'reasoning-delta', index: 0, text: 'thinking'},
+  {type: 'text-delta', index: 0, delta: 'x'}, {type: 'reasoning-delta', index: 0, delta: 'thinking'},
+  {type: 'text-delta', index: 0, text: '', delta: ' '},
+  {type: 'reasoning-delta', index: 0, text: null, delta: 'thinking'},
   {type: 'tool-call-delta', index: 0, id: '', argumentsDelta: '{'},
   {type: 'tool-call-delta', index: 0, id: 'call-synthetic', argumentsDelta: '', name: 'tool'},
   {type: 'tool-call-delta', index: 0, id: 'call-synthetic', name: 'tool', argumentsDelta: '{'}]) {
@@ -108,12 +115,46 @@ for (const first of [text('x'), {type: 'reasoning-delta', index: 0, text: 'think
   });
 }
 
+for (const type of ['text-delta', 'reasoning-delta']) test(type + ' with only delta preserves chunk identity and once-only terminal metrics', async t => {
+  const rows = [], f = fixture(t, {onRecord: row => {rows.push(row);}});
+  const controller = new AbortController(), first = Object.freeze({type, index: 0, delta: 'synthetic token'}), terminal = done();
+  const stream = f.hook(options({signal: controller.signal}), () => (async function* () {
+    f.tick(25); yield first;
+    f.tick(1025); yield usage({outputTokens: 8}); yield terminal;
+    f.tick(5000); yield {type, index: 0, delta: 'late ignored token'}; yield done('error');
+  })());
+  assert.equal((await stream.next()).value, first);
+  assert.equal(f.telemetry.snapshot().entries[0].ttftMs, 25);
+  assert.equal(f.telemetry.snapshot().entries[0].tps, null);
+  const output = await collect(stream); controller.abort();
+  assert.equal(output[1], terminal);
+  assert.equal(rows.length, 1); assert.equal(rows[0].ttftMs, 25); assert.equal(rows[0].tps, 8);
+  assert.equal(rows[0].durationMs, 1025); assert.equal(rows[0].status, 'success');
+  assert.equal(f.telemetry.snapshot().summary.success, 1); assert.equal(f.telemetry.snapshot().summary.samples.tps, 1);
+});
+
+test('token field accessors are ignored without losing a safe delta or invoking getters', async t => {
+  const f = fixture(t);
+  let reads = 0;
+  const first = Object.freeze({type: 'text-delta', delta: 'synthetic token', get text() {reads++; throw Error('private getter');}});
+  const response = await collect(f.hook(options(), () => (async function* () {
+    f.tick(10); yield {type: 'reasoning-delta', get delta() {reads++; return 'not evidence';}};
+    f.tick(20); yield first;
+    f.tick(1020); yield usage({outputTokens: 2}); yield done();
+  })()));
+  assert.equal(response[1], first); assert.equal(reads, 0);
+  assert.equal(f.telemetry.snapshot().entries[0].ttftMs, 20); assert.equal(f.telemetry.snapshot().entries[0].tps, 2);
+});
+
 test('usage/finish and empty or malformed deltas do not invent a first token', async t => {
   const f = fixture(t);
   await collect(f.hook(options(), () => chunks(text(''), {type: 'reasoning-delta', text: false},
     {type: 'tool-call-delta', id: 'call-metadata', argumentsDelta: ''},
     {type: 'tool-call-delta', argumentsDelta: {}, name: ''},
     {type: 'tool-call-delta', arguments: 'not-a-delta-field'}, {type: 'thinking_delta', delta: 'not-the-host-protocol'},
+    ...[undefined, null, '', false, 0, [], {}, {text: 'not-a-string'}].flatMap(delta => [
+      {type: 'text-delta', delta}, {type: 'reasoning-delta', delta}]),
+    {type: 'usage', delta: 'not-a-token'}, {type: 'block-start', delta: 'not-a-token'},
     usage({inputTokens: 2, outputTokens: 3, totalTokens: 5}), done())));
   const e = f.telemetry.snapshot().entries[0];
   assert.equal(e.ttftMs, null); assert.equal(e.tps, null);
@@ -862,4 +903,130 @@ for (const code of ['CPA_ACCOUNT_INACTIVE', 'CPA_BINDING_MISMATCH', 'CPA_TRANSPO
   const f = fixture(t);
   await collect(f.hook(options(), () => chunks(done('error', {code}))));
   assert.equal(f.telemetry.snapshot().entries[0].errorCode, code);
+});
+
+// No network, ambient auth, disk profile or mocked adapter chunks: production
+// CPA transport -> bundled public PiAiAdapter -> pi-ai's real SSE parser.
+async function sdkFixture(t, {defaultClock = false} = {}) {
+  const ctx = new Context();
+  new LlmRuntime(ctx);
+  const accountId = 'telemetry-synthetic', provider = 'cpa-codex-' + accountId;
+  const signal = new AbortController().signal, fetched = deferred(), rows = [], calls = [];
+  const access = 'synthetic.' + Buffer.from(JSON.stringify({sub: 'telemetry-subject',
+    'https://api.openai.com/auth': {chatgpt_account_id: 'telemetry-upstream'}})).toString('base64url') + '.signature';
+  const binding = {accountId, providerId: provider, email: 'telemetry@example.test', principalHash: 'synthetic-principal', signal,
+    assertCurrent: async () => {}, credentials: {
+      async read(key) {assert.equal(key, provider); return {type: 'oauth', access,
+        refresh: 'synthetic-never-refresh', expires: 4102444800000, accountId: 'telemetry-upstream'};},
+      async modify() {throw Error('synthetic grant must never refresh');},
+    }};
+  let clock = 0, wall = 0, body;
+  const telemetry = createTelemetry(ctx, {...(defaultClock ? {} : {now: () => clock}),
+    dateNow: () => wall, onRecord: row => {rows.push(row);}});
+  const transport = createCpaTransport(ctx, {telemetry, getFast: () => true, accounts: {
+    async list() {return [{id: accountId, provider, email: binding.email}];},
+    async capture(id, route) {assert.equal(id, accountId); assert.equal(route, provider); return binding;},
+  }, fetchImpl: async (input, init) => {
+    assert.equal(String(input), 'https://chatgpt.com/backend-api/codex/responses');
+    const bytes = Buffer.from(init.body), headers = new Headers(init.headers);
+    calls.push(JSON.parse((headers.get('content-encoding') === 'zstd' ? zlib.zstdDecompressSync(bytes) : bytes).toString('utf8')));
+    const response = new Response(new ReadableStream({start(controller) {body = controller;}}),
+      {status: 200, headers: {'content-type': 'text/event-stream'}});
+    fetched.resolve(); return response;
+  }});
+  t.after(() => {transport.dispose(); telemetry.dispose(); try {body?.close();} catch {}});
+  await transport.refresh();
+  return {telemetry, transport, accountId, provider, fetched: fetched.promise, rows, calls,
+    tick(value) {clock = value;}, wall(value) {wall = value;},
+    send(...events) {body.enqueue(new TextEncoder().encode(events.map(event => 'data: ' + JSON.stringify(event) + '\n\n').join('')));},
+    close() {body.close();}};
+}
+
+async function sdkTiming(t, {kind = 'text', counts = rawCounts(), emitDelta = true, omitUsage = false, defaultClock = false} = {}) {
+  const f = await sdkFixture(t, {defaultClock}), request = {provider: f.provider, model: 'gpt-5.5', reasoningEffort: 'high',
+    messages: [{role: 'user', content: [{type: 'text', text: 'synthetic timing request'}]}], tools: []};
+  const item = kind === 'reasoning'
+    ? {id: 'rs_telemetry', type: 'reasoning', summary: [{type: 'summary_text', text: 'synthetic thought'}], encrypted_content: 'synthetic-encrypted'}
+    : kind === 'tool'
+    ? {id: 'fc_telemetry', type: 'function_call', call_id: 'call_telemetry', name: 'weather', arguments: '{"city":"Oslo"}', status: 'completed'}
+    : {id: 'msg_telemetry', type: 'message', role: 'assistant', status: 'completed', content: [{type: 'output_text', text: 'synthetic answer', annotations: []}]};
+  const iterator = f.transport.stream(f.accountId, request)[Symbol.asyncIterator](), output = [];
+  const initial = iterator.next(); await f.fetched;
+  assert.equal(f.telemetry.hasRunningConversation(f.provider), true);
+  f.tick(20); f.wall(86400000);
+  f.send({type: 'response.created', response: {id: 'resp_telemetry'}},
+    {type: 'response.output_item.added', output_index: 0,
+      item: {...item, ...(kind === 'text' ? {content: []} : kind === 'tool' ? {arguments: ''} : {summary: []})}});
+  output.push((await initial).value);
+  assert.equal(output[0].type, 'block-start');
+  assert.equal(f.telemetry.snapshot().entries[0].ttftMs, null);
+  if (emitDelta) {
+    f.tick(100); f.wall(-86400000);
+    f.send({type: kind === 'reasoning' ? 'response.reasoning_summary_text.delta' : kind === 'tool'
+      ? 'response.function_call_arguments.delta' : 'response.output_text.delta', output_index: 0, content_index: 0,
+      delta: kind === 'reasoning' ? 'synthetic thought' : kind === 'tool' ? item.arguments : 'synthetic answer'});
+    output.push((await iterator.next()).value);
+    assert.equal(output[1].type, kind === 'reasoning' ? 'reasoning-delta' : kind === 'tool' ? 'tool-call-delta' : 'text-delta');
+  }
+  f.tick(1100); f.wall(999999999999);
+  f.send({type: 'response.output_item.done', output_index: 0, item},
+    {type: 'response.completed', response: {id: 'resp_telemetry', status: 'completed', model: request.model,
+      output: [item], service_tier: 'default', ...(omitUsage ? {} : {usage: counts})}});
+  f.close(); output.push(...await collect(iterator));
+  return {...f, output};
+}
+
+test('genuine SDK SSE uses the default monotonic clock with its required Performance receiver', {timeout: 5000}, async t => {
+  const before = performance.now(), f = await sdkTiming(t, {defaultClock: true}), after = performance.now();
+  const row = f.telemetry.snapshot().entries[0];
+  // Deliberately do not inject now: detached performance.now throws ERR_INVALID_THIS
+  // on supported Node 22/24, silently making all three production metrics unknown.
+  assert.equal(Number.isFinite(row.ttftMs), true);
+  assert.equal(Number.isFinite(row.durationMs), true);
+  assert.equal(Number.isFinite(row.tps), true);
+  assert.ok(row.ttftMs >= 0); assert.ok(row.durationMs > row.ttftMs); assert.ok(row.durationMs <= after - before);
+  assert.equal(row.tps, row.outputTokens / ((row.durationMs - row.ttftMs) / 1000));
+  assert.equal(row.outputTokens, 20); assert.equal(row.usageEvidence, 'provider');
+  assert.equal(row.serviceTierRequested, 'priority'); assert.equal(row.serviceTierReported, 'default');
+  assert.equal(f.rows.length, 1); assert.deepEqual(f.rows[0], row);
+  assert.equal(f.telemetry.snapshot().summary.samples.ttft, 1); assert.equal(f.telemetry.snapshot().summary.samples.tps, 1);
+  t.diagnostic(JSON.stringify({node: process.version, ttftMs: row.ttftMs, durationMs: row.durationMs, tps: row.tps,
+    inputTokens: row.inputTokens, outputTokens: row.outputTokens, cacheReadTokens: row.cacheReadTokens,
+    cacheWriteTokens: row.cacheWriteTokens, usageEvidence: row.usageEvidence}));
+});
+
+for (const kind of ['text', 'reasoning', 'tool']) test('genuine bundled SDK SSE ' + kind + ' produces numeric TTFT/TPS with raw usage', {timeout: 5000}, async t => {
+  const f = await sdkTiming(t, {kind, counts: rawCounts({output_tokens_details: {reasoning_tokens: 10}})});
+  const row = f.telemetry.snapshot().entries[0], terminal = f.output.at(-1);
+  assert.equal(terminal.reason.kind, kind === 'tool' ? 'tool-calls' : 'stop');
+  assert.ok(terminal.replayState);
+  assert.equal(f.rows.length, 1); assert.equal(f.rows[0].id, row.id);
+  assert.equal(f.telemetry.hasRunningConversation(f.provider), false);
+  assert.equal(f.calls[0].service_tier, 'priority'); assert.equal(f.calls[0].reasoning.effort, 'high');
+  assert.equal(row.serviceTierRequested, 'priority'); assert.equal(row.serviceTierReported, 'default');
+  assert.equal(row.ttftMs, 100); assert.equal(row.durationMs, 1100); assert.equal(row.tps, 20);
+  assert.equal(row.usageEvidence, 'provider'); assert.equal(row.inputTokens, 100); assert.equal(row.outputTokens, 20);
+  assert.equal(row.cacheReadTokens, 40); assert.equal(row.cacheWriteTokens, 0); assert.equal(row.cacheHitRate, 0.4);
+  const normalized = f.output.find(chunk => chunk.type === 'usage').usage;
+  assert.equal(normalized.inputTokens, 60); assert.equal(normalized.outputTokens, 20);
+  assert.equal(f.telemetry.snapshot().summary.samples.ttft, 1); assert.equal(f.telemetry.snapshot().summary.samples.tps, 1);
+  assert.equal(JSON.stringify(row).includes('synthetic answer'), false);
+  assert.equal(JSON.stringify(row).includes('synthetic-encrypted'), false);
+});
+
+for (const [label, counts, outputTokens, rate] of [
+  ['absent', undefined, null, null], ['null', null, null, null], ['partial', {input_tokens: 100}, null, null],
+  ['malformed', {input_tokens: 100, output_tokens: false}, null, null],
+  ['explicit zero', rawCounts({output_tokens: 0, total_tokens: 100}), 0, 0],
+]) test('genuine SDK SSE ' + label + ' raw usage preserves unknown versus zero TPS', {timeout: 5000}, async t => {
+  const f = await sdkTiming(t, {counts, omitUsage: label === 'absent'}), row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.ttftMs, 100); assert.equal(row.durationMs, 1100);
+  assert.equal(row.outputTokens, outputTokens); assert.equal(row.tps, rate);
+  assert.equal(f.telemetry.snapshot().summary.samples.tps, rate === null ? 0 : 1);
+});
+
+test('genuine SDK completed blocks and raw usage never backdate a missing first delta', {timeout: 5000}, async t => {
+  const f = await sdkTiming(t, {emitDelta: false}), row = f.telemetry.snapshot().entries[0];
+  assert.equal(row.outputTokens, 20); assert.equal(row.ttftMs, null); assert.equal(row.tps, null);
+  assert.equal(f.telemetry.snapshot().summary.samples.ttft, 0);
 });

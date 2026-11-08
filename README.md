@@ -4,6 +4,13 @@ Isolated ChatGPT Codex accounts, quota, real Fast, persistent request metadata a
 
 Install from the [GitHub repository](https://github.com/M4rkzzz/dsh-cpa) through DSH Market, or install the packaged archive. The GitHub channel detects version bumps on the default branch without requiring a GitHub Release.
 
+## 0.2.9
+
+- Fast is a native checkbox switch with a visible track/thumb, keyboard interaction, pending feedback and actionable unavailable messages.
+- Fast targets the single enabled CPA account independently of the displayed host quota. A valid ACK survives stale quota polls; late shared model catalogs no longer block a supported current model.
+- Fix the unbound default monotonic clock that made TTFT, duration and TPS unknown. New requests receive measured values; old rows cannot be reconstructed and are not backfilled.
+- Clarify requested/reported service tier separately from model reasoning effort: `priority / default` is unrelated to `max`.
+
 ## 0.2.8
 
 - Fix desktop updates rejected with `ERR_PNPM_IGNORED_BUILDS`: public PiAiAdapter/Codex SDK code is prebuilt before publishing, so consumers do not install the complete provider dependency graph. No dependency build approval or desktop policy change is needed.

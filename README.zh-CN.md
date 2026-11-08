@@ -4,6 +4,13 @@ ChatGPT Codex 多账号、额度、真实 Fast、持久请求日志和纯内存�
 
 通过 DSH Market 从 [GitHub 仓库](https://github.com/M4rkzzz/dsh-cpa)安装，或安装打包归档。默认分支的版本更新即可被 GitHub 来源检测，不依赖 GitHub Release。
 
+## 0.2.9
+
+- Fast 改为原生 checkbox 滑动开关，鼠标/触摸/键盘均可操作，显示保存中；不可用时点击会说明原因，而不是无响应。
+- Fast 使用唯一启用的 CPA 账号，不再误绑宿主额度账号；已确认的开关状态不会因旧额度轮询卡住而丢失，目录更新滞后也不会误判模型不支持。
+- 修复默认单调时钟丢失绑定导致 TTFT、耗时和 TPS 全为空的问题。新请求开始记录真实观测；旧日志没有时间证据，不会伪造补值。
+- 日志明确标注“服务等级：请求 / 返回”。`priority / default` 不是推理档位，`max` 等推理强度仍在模型菜单设置。
+
 ## 0.2.8
 
 - 修复桌面更新被 `ERR_PNPM_IGNORED_BUILDS` 阻断：公共 PiAiAdapter/Codex SDK 在发布前预构建，消费者不再安装整套 provider 依赖。无需批准第三方构建脚本，也不修改桌面安全策略。
